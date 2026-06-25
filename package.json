@@ -1,6 +1,6 @@
 {
   "name": "@aprimediet/minion",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "type": "module",
   "description": "TodoWrite + subagent/Task + a bundled library of 12 specialized agents for the pi coding agent.",
   "keywords": ["pi-package"],
