@@ -1,0 +1,17 @@
+{
+  "models": {
+    "*": "claude-sonnet-4-6",
+    "general-purpose": "claude-sonnet-4-6",
+    "explore": "claude-haiku-4-5",
+    "plan": "claude-sonnet-4-6",
+    "code-reviewer": "claude-opus-4-8",
+    "code-simplifier": "claude-sonnet-4-6",
+    "silent-failure-hunter": "claude-sonnet-4-6",
+    "type-design-analyzer": "claude-opus-4-8",
+    "comment-analyzer": "claude-haiku-4-5",
+    "pr-test-analyzer": "claude-sonnet-4-6",
+    "debugger": "claude-sonnet-4-6",
+    "test-writer": "claude-sonnet-4-6",
+    "docs-writer": "claude-haiku-4-5"
+  }
+}
