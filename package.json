@@ -4,11 +4,28 @@
   "type": "module",
   "description": "TodoWrite + subagent/Task + a bundled library of 12 specialized agents for the pi coding agent.",
   "keywords": ["pi-package"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aprimediet/pi-minion.git"
+  },
+  "bugs": {
+    "url": "https://github.com/aprimediet/pi-minion/issues"
+  },
+  "homepage": "https://github.com/aprimediet/pi-minion#readme",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "scripts": {
+    "prepublishOnly": "node -e \"const pkg=require('./package.json'); if(!pkg.files||pkg.files.length===0){console.error('files field empty — abort');process.exit(1)}; console.log('Publishing '+pkg.name+'@'+pkg.version+' with files:', pkg.files)\"",
+    "pack:dry": "npm pack --dry-run"
+  },
   "pi": {
     "extensions": ["./index.ts"],
     "prompts": ["./prompts"]
   },
-  "files": ["*.ts", "minion.json", "agents/**", "prompts/**", "README.md"],
+  "files": ["*.ts", "minion.json", "agents/**", "prompts/**", "README.md", "LICENSE"],
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-agent-core": "*",
