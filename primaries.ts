@@ -189,7 +189,7 @@ export interface AgentConfigLike {
 /** Subset of `ExtensionAPI` that the controller touches. Avoids a hard import. */
 export interface PrimaryControllerPi {
 	setActiveTools(tools: string[]): void;
-	setModel(model: Model<any> | string): Promise<boolean> | boolean | void;
+	setModel(model: Model<any>): Promise<boolean> | boolean | void;
 	getActiveTools(): string[];
 	getAllTools(): Array<{ name: string }>;
 	getThinkingLevel(): "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -204,7 +204,10 @@ export interface PrimaryControllerContext {
 	cwd: string;
 	ui: { notify: (msg: string) => void; setStatus: (key: string, text: string | undefined) => void };
 	model?: Model<any>;
-	modelRegistry?: { find: (provider: string, model: string) => Model<any> | undefined };
+	modelRegistry?: {
+		find: (provider: string, model: string) => Model<any> | undefined;
+		getAll?: () => Model<any>[];
+	};
 	sessionManager?: { getEntries: () => unknown[] };
 }
 
@@ -233,7 +236,10 @@ export interface PrimaryController {
 	injectSystemPrompt(event: { systemPrompt: string }):
 		| { systemPrompt: string }
 		| undefined;
-	onModelChanged(model: { id: string } | Model<any>, ctx: PrimaryControllerContext): void;
+	onModelChanged(
+		model: { id: string; provider?: string } | Model<any>,
+		ctx: PrimaryControllerContext,
+	): void;
 }
 
 interface Snapshot {
@@ -262,6 +268,22 @@ export function createPrimaryController(
 
 	let active: PrimaryAgent | undefined;
 	let snapshot: Snapshot | undefined;
+
+	// v2.1.1 v3 — Guard flag for the `model_select` event:
+	// pi.setModel() inside setModelFor emits a `model_select` event with
+	// source="set", which the global handler in index.ts forwards to
+	// onModelChanged. Without the guard, that handler would overwrite the
+	// stored model in settings.json every time we switch primaries, even
+	// though the change was programmatic (extension-initiated), not
+	// user-initiated.
+	//
+	// The guard is a "match-by-id" check: when the controller sets a model,
+	// the same Model identity flows back through model_select a tick later.
+	// We track the in-flight programmatic set with its identity; the
+	// subsequent `model_select` carrying the same model skips persistence.
+	// This works regardless of whether pi emits the event synchronously or
+	// asynchronously (microtask) — the identity check survives the event loop.
+	let _pendingProgrammaticSet: Model<any> | null = null;
 
 	function readOverridesDefault(p?: string): Record<string, AgentOverride> {
 		return readAgentOverrides(p ?? defaultSettingsPath());
@@ -315,19 +337,65 @@ export function createPrimaryController(
 			overrides,
 			p.name,
 		);
-		if (!resolvedModelId) return; // inherit — leave host model untouched
 
-		// If the host gave us a resolver, prefer it; otherwise pass the id
-		// directly (the host's setModel handles string→Model for us). The
-		// test fake accepts any value.
-		if (opts.resolveModel) {
-			const m = opts.resolveModel(resolvedModelId);
-			if (m) {
-				void pi.setModel(m);
-				return;
+		if (!resolvedModelId) {
+			// No model override → restore snapshot model (if any).
+			const snap = takeSnapshot(ctx);
+			if (snap.model) {
+				_pendingProgrammaticSet = snap.model;
+				try {
+					pi.setModel(snap.model);
+				} finally {
+					// Clear after pi synchronously returns. If pi emits
+					// model_select asynchronously, onModelChanged's identity
+					// check will have already-cleared the flag and we'd lose
+					// the match. Better strategy: clear the pending set after
+					// a microtask, so the async event still matches.
+					queueMicrotask(() => { _pendingProgrammaticSet = null; });
+				}
+			}
+			return;
+		}
+
+		// Resolve "provider/model" string to a Model<any> object.
+		// ExtensionAPI.setModel() requires a Model object, not a string.
+		let model: Model<any> | undefined;
+
+		const parts = resolvedModelId.split('/');
+		const hasProvider = parts.length >= 2;
+		const provider = hasProvider ? parts[0] : '';
+		const modelName = hasProvider ? parts.slice(1).join('/') : resolvedModelId;
+
+		if (hasProvider && ctx.modelRegistry?.find) {
+			model = ctx.modelRegistry.find(provider, modelName);
+		}
+
+		// No provider in ID, or registry.find missed: try getAll().
+		if (!model && ctx.modelRegistry?.getAll) {
+			model = ctx.modelRegistry.getAll().find(
+				(m) => m.id === resolvedModelId || m.name === resolvedModelId,
+			);
+		}
+
+		// Test seam / last resort.
+		if (!model && opts.resolveModel) {
+			model = opts.resolveModel(resolvedModelId);
+		}
+
+		if (model) {
+			// Track in-flight programmatic set. real pi may emit model_select
+			// synchronously *or* asynchronously — using a microtask to clear
+			// the pending marker handles both: a sync handler clears it before
+			// finally runs (via direct match), and an async handler reads the
+			// identity in the next microtask before we null it.
+			_pendingProgrammaticSet = model;
+			try {
+				pi.setModel(model);
+			} finally {
+				queueMicrotask(() => { _pendingProgrammaticSet = null; });
 			}
 		}
-		void pi.setModel(resolvedModelId);
+		// No model resolved → inherit current (no change).
 	}
 
 	function updateStatus(p: PrimaryAgent | undefined, ctx: PrimaryControllerContext): void {
@@ -378,14 +446,38 @@ export function createPrimaryController(
 		return (m as { id?: string }).id ?? "";
 	}
 
+	function modelProvider(m: { id: string } | Model<any>): string {
+		return (m as { provider?: string }).provider ?? "";
+	}
+
 	function onModelChanged(
-		model: { id: string } | Model<any>,
+		model: { id: string; provider?: string } | Model<any>,
 		_ctx: PrimaryControllerContext,
 	): void {
 		if (!active) return;
+		// Skip if this model change was triggered programmatically by the
+		// controller itself (see setModelFor). Match by identity: if the model
+		// being signalled was the same one we just programmatically set, it was
+		// an internal load, not a user-initiated change. We compare by reference
+		// (===) for objects from modelRegistry; for plain {id, provider} shape
+		// passed from tests, compare by id+provider string. The first call to
+		// onModelChanged clears the pending marker so we don't suppress the
+		// *next* legitimate user change.
+		const incomingId = (model as { id?: string }).id ?? "";
+		const incomingProvider = (model as { provider?: string }).provider ?? "";
+		const pending = _pendingProgrammaticSet;
+		if (pending && (pending as { id?: string }).id === incomingId && (pending as { provider?: string }).provider === incomingProvider) {
+			_pendingProgrammaticSet = null;
+			return;
+		}
 		const id = modelId(model);
 		if (!id) return;
-		void writeOverride(active.name, { model: id }, settingsPath);
+		// Persist full "provider/model-id" so setModelFor can split with /
+		// and resolve via modelRegistry.find. If no provider on the model,
+		// fall back to plain id (rare; legacy compat).
+		const provider = modelProvider(model);
+		const fullId = provider ? `${provider}/${id}` : id;
+		void writeOverride(active.name, { model: fullId }, settingsPath);
 	}
 
 	return {

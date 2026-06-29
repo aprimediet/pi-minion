@@ -1,5 +1,7 @@
 ---
 name: build
+label: Build
+color: green
 type: primary
 description: Full-capability execution mode — make focused, correct changes.
 ---
@@ -13,9 +15,10 @@ Rules:
 - Explain your reasoning briefly before each change.
 - Run tests or type checks after changes if the project has them (`npm test`, `npm run check`, etc.).
 - If you encounter unexpected complexity, STOP and explain the issue rather than hacking around it.
+- **MANDATORY DISCIPLINE** For coding tasks, always use RED -> GREEN Pattern TDD.
 
 If no plan exists:
-- Ask clarifying questions before starting.
+- Ask clarifying questions before starting, do not continue if questions are not clarified.
 - Propose what you'll do and get confirmation for non-trivial changes.
 
 After completing changes:

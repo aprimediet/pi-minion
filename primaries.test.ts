@@ -105,7 +105,11 @@ function fakePi() {
  * time — if `PrimaryControllerContext` adds a required field, this helper
  * becomes a type error rather than a silent runtime bug.
  */
-function fakeCtx(overrides: { cwd?: string; model?: unknown } = {}): PrimaryControllerContext & {
+function fakeCtx(overrides: {
+	cwd?: string;
+	model?: unknown;
+	modelRegistry?: PrimaryControllerContext["modelRegistry"];
+} = {}): PrimaryControllerContext & {
 		ui: PrimaryControllerContext["ui"] & {
 			setStatus: ReturnType<typeof vi.fn>;
 			notify: ReturnType<typeof vi.fn>;
@@ -117,7 +121,7 @@ function fakeCtx(overrides: { cwd?: string; model?: unknown } = {}): PrimaryCont
 			ui: { notify: vi.fn(), setStatus: vi.fn() },
 			model: overrides.model as PrimaryControllerContext["model"],
 			sessionManager: { getEntries: vi.fn(() => []) },
-			modelRegistry: { find: vi.fn(() => undefined) },
+			modelRegistry: overrides.modelRegistry ?? { find: vi.fn(() => undefined) },
 		};
 	}
 
@@ -314,53 +318,119 @@ describe("createPrimaryController", () => {
 		expect(calls.setActiveTools).toEqual([["read", "bash", "edit", "write"]]);
 	});
 
-	it("apply() resolves model from settings override > frontmatter > inherit", async () => {
-		const settingsPath = path.join(tmp, "settings.json");
-		// 1. settings wins over frontmatter
-		fs.writeFileSync(
-			settingsPath,
-			JSON.stringify({ agents: { plan: { model: "from-settings" } } }),
-		);
+	it("apply('plan') with settings override calls pi.setModel with Model object via registry.find", async () => {
 		const { pi, calls } = fakePi();
-		const readOverrides = vi.fn(() => ({ plan: { model: "from-settings" } }));
-		const writeOverride = vi.fn(async () => true);
+		const fakeModel = { id: "from-settings", provider: "test", name: "from-settings" } as const;
+		const modelRegistry = { find: vi.fn(() => fakeModel) };
+		const readOverrides = vi.fn(() => ({ plan: { model: "test/from-settings" } }));
 		const c = createPrimaryController(pi, primaries, {
 			defaultName: "build",
-			settingsPath,
 			readOverrides,
-			writeOverride,
 		});
-		await c.apply("plan", fakeCtx());
-		expect(calls.setModelFn).toHaveBeenCalledOnce();
-		expect(calls.setModelFn.mock.calls[0][0]).toBe("from-settings");
+		await c.apply("plan", fakeCtx({ modelRegistry }));
+		// registry.find called with correct provider + model name
+		expect(modelRegistry.find).toHaveBeenCalledWith("test", "from-settings");
+		// setModel called with the Model OBJECT (not a string)
+		expect(calls.setModelFn).toHaveBeenCalledWith(fakeModel);
+	});
 
-		// 2. fall back to frontmatter when settings has no entry
-		calls.setModelFn.mockClear();
-		const c2 = createPrimaryController(pi, [
-			makePlanPrimary(), // already has model in frontmatter via override above; rebuild fresh
+	it("apply('plan') with frontmatter model (no provider) falls back to getAll()", async () => {
+		const { pi, calls } = fakePi();
+		const fakeModel = { id: "claude-sonnet-4-5", provider: "anthropic", name: "claude-sonnet-4-5" } as const;
+		const modelRegistry = {
+			find: vi.fn(() => undefined),
+			getAll: vi.fn(() => [fakeModel, { id: "other", provider: "x", name: "other" }]),
+		};
+		const c = createPrimaryController(pi, [
+			makePrimary({ name: "plan", model: "claude-sonnet-4-5" }),
 		], {
 			defaultName: "build",
-			settingsPath,
-			readOverrides: vi.fn(() => ({})), // no override
-			writeOverride,
-		});
-		// give plan a frontmatter model
-		c2.list()[0].model = "from-frontmatter";
-		await c2.apply("plan", fakeCtx());
-		expect(calls.setModelFn.mock.calls[0][0]).toBe("from-frontmatter");
-
-		// 3. inherit (no setModel) when neither has it
-		calls.setModelFn.mockClear();
-		const c3 = createPrimaryController(pi, [
-			makePrimary({ name: "plan", model: undefined }),
-		], {
-			defaultName: "build",
-			settingsPath,
 			readOverrides: vi.fn(() => ({})),
-			writeOverride,
 		});
-		await c3.apply("plan", fakeCtx());
+		await c.apply("plan", fakeCtx({ modelRegistry }));
+		expect(modelRegistry.getAll).toHaveBeenCalled();
+		expect(calls.setModelFn).toHaveBeenCalledWith(fakeModel);
+	});
+
+	it("apply('plan') with no model (override nor frontmatter) restores snapshot model from ctx", async () => {
+		const { pi, calls } = fakePi();
+		const snapshotModel = { id: "original", provider: "test", name: "original" } as const;
+		const modelRegistry = { find: vi.fn(() => undefined) };
+		const ctx = fakeCtx({ model: snapshotModel, modelRegistry });
+		const c = createPrimaryController(pi, primaries, {
+			defaultName: "build",
+			readOverrides: vi.fn(() => ({})),
+		});
+		await c.apply("plan", ctx);
+		// plan has no model → restore snapshot model
+		expect(calls.setModelFn).toHaveBeenCalledWith(snapshotModel);
+	});
+
+	it("apply('plan') gracefully skips model when modelRegistry unavailable", async () => {
+		const { pi, calls } = fakePi();
+		const readOverrides = vi.fn(() => ({ plan: { model: "test/any" } }));
+		const c = createPrimaryController(pi, primaries, {
+			defaultName: "build",
+			readOverrides,
+		});
+		const ctx = fakeCtx();
+		delete (ctx as any).modelRegistry;
+		await c.apply("plan", ctx);
+		// no modelRegistry → fall through → no setModel
 		expect(calls.setModelFn).not.toHaveBeenCalled();
+	});
+
+	it("apply('plan') falls back to opts.resolveModel when modelRegistry.find/getAll fail", async () => {
+		const { pi, calls } = fakePi();
+		const resolveModel = vi.fn(() => ({ id: "resolved", provider: "test", name: "resolved" } as const));
+		const modelRegistry = {
+			find: vi.fn(() => undefined),
+			getAll: vi.fn(() => [] as Array<{ id: string; provider: string; name: string }>),
+		};
+		const readOverrides = vi.fn(() => ({ plan: { model: "test/fallback" } }));
+		const c = createPrimaryController(pi, primaries, {
+			defaultName: "build",
+			readOverrides,
+			resolveModel,
+		});
+		await c.apply("plan", fakeCtx({ modelRegistry }));
+		expect(resolveModel).toHaveBeenCalledWith("test/fallback");
+		expect(calls.setModelFn).toHaveBeenCalled();
+	});
+
+	it("inherit (no setModel) when modelRegistry returns undefined and no opts.resolveModel", async () => {
+		const { pi, calls } = fakePi();
+		const modelRegistry = { find: vi.fn(() => undefined), getAll: vi.fn(() => []) };
+		const readOverrides = vi.fn(() => ({ plan: { model: "test/nonexistent" } }));
+		const c = createPrimaryController(pi, primaries, {
+			defaultName: "build",
+			readOverrides,
+		});
+		await c.apply("plan", fakeCtx({ modelRegistry }));
+		expect(calls.setModelFn).not.toHaveBeenCalled();
+	});
+
+	it("restores snapshot model when switching to a primary with no model after one with model", async () => {
+		const { pi, calls } = fakePi();
+		const planModel = { id: "plan-specific", provider: "test", name: "plan" } as const;
+		const snapshotModel = { id: "original", provider: "test", name: "original" } as const;
+		const modelRegistry = {
+			find: vi.fn((provider: string, modelName: string) =>
+				provider === "test" && modelName === "plan-model" ? planModel : undefined
+			),
+		};
+		const ctx = fakeCtx({ model: snapshotModel, modelRegistry });
+		const readOverrides = vi.fn(() => ({ plan: { model: "test/plan-model" } }));
+		const c = createPrimaryController(pi, primaries, {
+			defaultName: "build",
+			readOverrides,
+		});
+		// apply plan → loads planModel
+		await c.apply("plan", ctx);
+		expect(calls.setModelFn).toHaveBeenLastCalledWith(planModel);
+		// apply build (no model) → restores snapshotModel
+		await c.apply("build", ctx);
+		expect(calls.setModelFn).toHaveBeenLastCalledWith(snapshotModel);
 	});
 
 	it("cycle(ctx) advances through list() in order, wrapping", async () => {
@@ -394,7 +464,7 @@ describe("createPrimaryController", () => {
 		expect(out).toEqual({ systemPrompt: "BASE\n\nbe plan" });
 	});
 
-	it("onModelChanged while a primary is active calls writeAgentOverride", async () => {
+	it("onModelChanged while a primary is active calls writeAgentOverride with provider/id format", async () => {
 		const { pi } = fakePi();
 		const writeOverride = vi.fn(async () => true);
 		const settingsPath = path.join(tmp, "settings.json");
@@ -405,11 +475,30 @@ describe("createPrimaryController", () => {
 			writeOverride,
 		});
 		await c.apply("plan", fakeCtx());
+		// Model has provider + id → must save "provider/id" format
+		c.onModelChanged({ id: "claude-opus-4-5", provider: "anthropic" }, fakeCtx());
+		expect(writeOverride).toHaveBeenCalledWith(
+			"plan",
+			{ model: "anthropic/claude-opus-4-5" },
+			settingsPath,
+		);
+	});
+
+	it("onModelChanged falls back to plain id when model has no provider", async () => {
+		const { pi } = fakePi();
+		const writeOverride = vi.fn(async () => true);
+		const c = createPrimaryController(pi, primaries, {
+			defaultName: "build",
+			readOverrides: vi.fn(() => ({})),
+			writeOverride,
+		});
+		await c.apply("plan", fakeCtx());
+		// No provider on the model → save just the id
 		c.onModelChanged({ id: "claude-opus-4-5" }, fakeCtx());
 		expect(writeOverride).toHaveBeenCalledWith(
 			"plan",
 			{ model: "claude-opus-4-5" },
-			settingsPath,
+			undefined,
 		);
 	});
 
@@ -423,6 +512,112 @@ describe("createPrimaryController", () => {
 		});
 		c.onModelChanged({ id: "claude-opus-4-5" }, fakeCtx());
 		expect(writeOverride).not.toHaveBeenCalled();
+	});
+
+	// ===========================================================================
+	// v2.1.1 v3 — guard flag: programmatic pi.setModel() must NOT persist
+	// to settings.json. Only USER-initiated model changes (via /model command
+	// or model cycling UI) should writeOverride.
+	// ===========================================================================
+
+	/**
+	 * Build a fake pi whose `setModel` defers a `model_select`-like callback
+	 * to the next microtask (mirroring real pi's async event emission timing —
+	 * after pi synchronously returns the new model).
+	 *
+	 * In production, real pi applies the model synchronously inside setModel()
+	 * but the `model_select` event fires after — so by the time the event
+	 * handler runs, the controller may have already advanced its internal
+	 * state (e.g., `active` is set). Our deferral matches this behavior:
+	 * the callback runs AFTER apply()'s synchronous work completes.
+	 */
+	function fakePiWithDeferredModelSelect(onModelSelected: (m: unknown) => void) {
+		const { pi, calls } = fakePi();
+		const realSetModel = pi.setModel;
+		const wrapped = {
+			...pi,
+			setModel: ((m: unknown) => {
+				// Defer to next microtask, matching real pi's async event emission.
+				queueMicrotask(() => onModelSelected(m));
+				return realSetModel(m as never);
+			}) as typeof pi.setModel,
+		};
+		return { pi: wrapped, calls };
+	}
+
+	it("programmatic pi.setModel() in setModelFor does NOT trigger writeOverride (guard)", async () => {
+		const fakeModel = { id: "loaded", provider: "x", name: "loaded" } as const;
+		const modelRegistry = { find: vi.fn(() => fakeModel), getAll: vi.fn(() => [fakeModel]) };
+		const readOverrides = vi.fn(() => ({ plan: { model: "x/loaded" } }));
+		const writeOverride = vi.fn(async () => true);
+
+		let onModelChangedRef: ((m: any) => void) | undefined;
+		const { pi } = fakePiWithDeferredModelSelect((m) => onModelChangedRef?.(m));
+
+		const c = createPrimaryController(pi, primaries, {
+			defaultName: "build",
+			readOverrides,
+			writeOverride,
+		});
+		// Bind the callback AFTER controller is created so it has access to
+		// the closure's _settingModelProgrammatically guard.
+		onModelChangedRef = (m) => c.onModelChanged(m, fakeCtx());
+
+		await c.apply("plan", fakeCtx({ modelRegistry }));
+		// Flush all microtasks so the deferred model_select callback runs.
+		await new Promise<void>((resolve) => queueMicrotask(resolve));
+		await new Promise<void>((resolve) => queueMicrotask(resolve));
+		// If the guard works, writeOverride was NEVER called during apply,
+		// even though model_select fired inside pi.setModel.
+		expect(writeOverride).not.toHaveBeenCalled();
+	});
+
+	it("USER-initiated onModelChanged (no prior programmatic set) DOES persist", async () => {
+		const { pi } = fakePi();
+		const writeOverride = vi.fn(async () => true);
+		const c = createPrimaryController(pi, primaries, {
+			defaultName: "build",
+			readOverrides: vi.fn(() => ({})),
+			writeOverride,
+		});
+		await c.apply("plan", fakeCtx());
+		c.onModelChanged({ id: "claude-sonnet-4-5", provider: "anthropic" }, fakeCtx());
+		expect(writeOverride).toHaveBeenCalledWith(
+			"plan",
+			{ model: "anthropic/claude-sonnet-4-5" },
+			undefined,
+		);
+	});
+
+	it("guard resets after setModelFor — guard is per-call scoped", async () => {
+		// Verify that the guard isn't accidentally sticky: after apply() returns,
+		// a USER-initiated onModelChanged should persist.
+		const fakeModel = { id: "loaded", provider: "x", name: "loaded" } as const;
+		const modelRegistry = { find: vi.fn(() => fakeModel) };
+		const readOverrides = vi.fn(() => ({ plan: { model: "x/loaded" } }));
+		const writeOverride = vi.fn(async () => true);
+
+		let onModelChangedRef: ((m: any) => void) | undefined;
+		const { pi } = fakePiWithDeferredModelSelect((m) => onModelChangedRef?.(m));
+		const c = createPrimaryController(pi, primaries, {
+			defaultName: "build",
+			readOverrides,
+			writeOverride,
+		});
+		onModelChangedRef = (m) => c.onModelChanged(m, fakeCtx());
+
+		await c.apply("plan", fakeCtx({ modelRegistry }));
+		// Flush microtasks so deferred model_select runs (and writeOverride is NOT called).
+		await new Promise<void>((resolve) => queueMicrotask(resolve));
+		await new Promise<void>((resolve) => queueMicrotask(resolve));
+		expect(writeOverride).not.toHaveBeenCalled();
+		// Now USER changes model manually → SHOULD persist (guard is reset).
+		c.onModelChanged({ id: "user-choice", provider: "x" }, fakeCtx());
+		expect(writeOverride).toHaveBeenCalledWith(
+			"plan",
+			{ model: "x/user-choice" },
+			undefined,
+		);
 	});
 
 	it("falls back to default 'build' when defaultName not specified", async () => {
