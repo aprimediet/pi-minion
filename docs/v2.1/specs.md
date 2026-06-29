@@ -98,6 +98,23 @@ the answers in a short comment block at the top of `primaries.ts`.
 - If it **cannot** → keep thinking on its built-in key, bind **primary-switch to a free key**
   (e.g. `Key.ctrlShift("p")`) and Alt+T optional; note the deviation in `primaries.ts` and README.
 
+**Final WP0 decision (recorded after the spike):** Shift+Tab **cannot** be overridden
+directly (extension registrations on `shift+tab` are silently dropped because
+`app.thinking.cycle` is in `RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS` with
+`restrictOverride=true`). The implementation therefore binds the primary-cycle
+extension shortcut on `Key.shift("tab")` (= `"shift+tab"`) and relies on a
+**user-side override** in `~/.pi/agent/keybindings.json` to free the key:
+
+```json
+{ "app.thinking.cycle": ["ctrl+shift+tab"] }
+```
+
+After this override, pi's `app.thinking.cycle` no longer claims `shift+tab`,
+so the extension `Shift+Tab` binding wins at runtime. `Key.alt("t")` is also
+registered as a free thinking-cycle alternative (also alt-bindable).
+This mirrors the `permission-modes` extension's behavior (which registers
+`shift+tab` for mode cycling the same way).
+
 No code ships from WP0 except the documented decision; proceed to WP1.
 
 ## WP1 — `agents.ts`: parse `type`

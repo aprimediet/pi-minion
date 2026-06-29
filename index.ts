@@ -1,26 +1,79 @@
 /**
- * Extension entry point — wires `subagent` tool + `/minion` command.
+ * Extension entry point — wires `subagent` tool + `/minion` command + the v2.1
+ * primary-agent controller.
  *
  * Exports `buildExtension(pi, deps)` so tests can inject `discoverAgents`,
- * `runAgentFn`, and `readOverrides`. `defaultExtension` is the real wiring
- * (calls into `./agents.ts`, `./runner.ts`, `./config.ts`).
+ * `runAgentFn`, `readOverrides`, `loadPrimaries`, and `writeOverride`.
+ * `defaultExtension` is the real wiring (calls into `./agents.ts`, `./runner.ts`,
+ * `./config.ts`, `./primaries.ts`).
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { CONFIG_DIR_NAME, getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+	CONFIG_DIR_NAME,
+	getAgentDir,
+	type ExtensionAPI,
+	type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
+import { Key } from "@earendil-works/pi-tui";
 import { SubagentParams, type AgentOverride, type SubagentDetails } from "./schema.ts";
-import { discoverAgents as realDiscoverAgents, formatAgentList, type AgentConfig, type AgentDiscoveryResult } from "./agents.ts";
-import { runSingle as realRunSingle, runParallel as realRunParallel, runChain as realRunChain, decideMode, type RunAgentFn } from "./modes.ts";
-import { readAgentOverrides as realReadOverrides, resolveAgentRuntime } from "./config.ts";
+import {
+	discoverAgents as realDiscoverAgents,
+	formatAgentList,
+	type AgentConfig,
+	type AgentDiscoveryResult,
+} from "./agents.ts";
+import { resolveAgentRuntime, readAgentOverrides as realReadAgentOverrides, writeAgentOverride as realWriteAgentOverride } from "./config.ts";
+import {
+	runSingle as realRunSingle,
+	runParallel as realRunParallel,
+	runChain as realRunChain,
+	decideMode,
+	type RunAgentFn,
+} from "./modes.ts";
 import { runSingleAgent as realRunSingleAgent } from "./runner.ts";
 import { renderCall, renderResult } from "./render.ts";
+import {
+	createPrimaryController as realCreatePrimaryController,
+	cycleThinkingLevel,
+	loadBundledPrimaries as realLoadBundledPrimaries,
+	resolvePrimaries,
+	type CreatePrimaryControllerOptions,
+	type PrimaryAgent,
+	type PrimaryController,
+} from "./primaries.ts";
+
+/** Loader function shape: takes an optional `dir` and returns bundled primaries. */
+export type LoadPrimariesFn = (dir?: string) => PrimaryAgent[];
+
+/** Writer function shape: matches the controller's `writeOverride` seam. */
+export type WriteOverrideFn = (
+	name: string,
+	patch: { model?: string; tools?: string },
+	settingsPath?: string,
+) => Promise<boolean> | boolean;
 
 export interface BuildExtensionDeps {
 	discoverAgents: (cwd: string, scope: "user" | "project" | "both") => AgentDiscoveryResult;
 	runAgentFn: RunAgentFn;
 	readOverrides: (settingsPath?: string) => Record<string, AgentOverride>;
+	/** Loader for bundled primaries. Default: `loadBundledPrimaries` reading `<here>/primaries`. */
+	loadPrimaries?: LoadPrimariesFn;
+	/** Writer injected into the primary controller (test seam). */
+	writeOverride?: WriteOverrideFn;
+	/**
+	 * Controller factory (test seam). Default: `createPrimaryController`. Tests
+	 * inject a wrapper that wraps `apply`/`onModelChanged` for spy assertions.
+	 * Note the leading underscore — this is an **internal** test seam, not part
+	 * of the public API surface.
+	 */
+	_createPrimaryController?: (
+		pi: ExtensionAPI,
+		primaries: PrimaryAgent[],
+		opts: CreatePrimaryControllerOptions,
+	) => PrimaryController;
 }
 
 /** Apply settings overrides to every agent. Returns a new array (agents are immutable inputs). */
@@ -40,6 +93,7 @@ function applyOverrides(
 const HERE =
 	typeof import.meta.dirname === "string" ? import.meta.dirname : path.dirname(fileURLToPath(import.meta.url));
 const BUNDLED_AGENTS_DIR = path.join(HERE, "agents");
+const BUNDLED_PRIMARIES_DIR = path.join(HERE, "primaries");
 
 /** Copy bundled `agents/*.md` into `<dest>` unless already present. Returns names copied. */
 export function installBundledAgents(dest: string): { copied: string[]; skipped: string[]; errors: string[] } {
@@ -76,13 +130,49 @@ export function installBundledAgents(dest: string): { copied: string[]; skipped:
 }
 
 /**
- * Wire up the subagent tool + /minion command and register them with `pi`.
+ * Wire up the subagent tool + /minion command + the primary-agent controller.
  *
  * Pure(ish) with respect to the injected deps — `discoverAgents`/`runAgentFn`/
- * `readOverrides` are passed in so unit tests can substitute fakes.
+ * `readOverrides`/`loadPrimaries`/`writeOverride` are passed in so unit tests
+ * can substitute fakes.
  */
 export function buildExtension(pi: ExtensionAPI, deps: BuildExtensionDeps): void {
 	const { discoverAgents, runAgentFn, readOverrides } = deps;
+	const loadPrimaries = deps.loadPrimaries ?? realLoadBundledPrimaries;
+	const writeOverride = deps.writeOverride;
+
+	// ===========================================================================
+	// v2.1 — Primary-agent controller (built up front; later commands/handlers
+	// close over it). Primaries are filtered to `type: "primary"` so subagent
+	// delegation never accidentally picks up a primary persona.
+	// ===========================================================================
+
+	const bundled = loadPrimaries(BUNDLED_PRIMARIES_DIR);
+	// Note: we resolve at session_start (so user `type: primary` agents are merged).
+	// For initial wiring we keep an empty resolved list; the controller can
+	// still operate on `bundled`-only at startup and the session_start handler
+	// replaces it.
+	let resolvedPrimaries: PrimaryAgent[] = resolvePrimaries(bundled, []);
+
+	const controllerOptions: CreatePrimaryControllerOptions = writeOverride
+		? { defaultName: "build", writeOverride }
+		: { defaultName: "build" };
+	const _createPrimaryController =
+		deps._createPrimaryController ?? realCreatePrimaryController;
+	let controller: PrimaryController = _createPrimaryController(
+		pi,
+		resolvedPrimaries,
+		controllerOptions,
+	);
+
+	// Helper to rebuild the controller when primaries change (e.g. session_start).
+	function rebuildController() {
+		controller = _createPrimaryController(pi, resolvedPrimaries, controllerOptions);
+	}
+
+	// ===========================================================================
+	// subagent tool (existing v2.0)
+	// ===========================================================================
 
 	pi.registerTool({
 		name: "subagent",
@@ -100,7 +190,13 @@ export function buildExtension(pi: ExtensionAPI, deps: BuildExtensionDeps): void
 			const agentScope = (params.agentScope ?? "user") as "user" | "project" | "both";
 			const discovery = discoverAgents(ctx.cwd, agentScope);
 			const overrides = readOverrides();
-			const agents = applyOverrides(discovery.agents, overrides);
+			// v2.1: subagent tool only sees `type: "subagent"` (or untyped) agents.
+			// A `type: "primary"` agent is filtered OUT — it's a main-loop persona,
+			// not delegatable.
+			const subagentOnlyAgents = discovery.agents.filter(
+				(a) => a.type === "subagent" || a.type === undefined,
+			);
+			const agents = applyOverrides(subagentOnlyAgents, overrides);
 			const confirmProjectAgents = params.confirmProjectAgents ?? true;
 
 			const mode = decideMode({
@@ -212,13 +308,135 @@ export function buildExtension(pi: ExtensionAPI, deps: BuildExtensionDeps): void
 		renderResult,
 	});
 
+	// ===========================================================================
+	// v2.1 — CLI flag + commands + shortcuts
+	// ===========================================================================
+
+	pi.registerFlag("agent", {
+		type: "string",
+		description: "Primary agent at startup (plan|build|<custom>)",
+	});
+
+	// Primary switch — `Key.shift("tab")`. pi's built-in `app.thinking.cycle`
+	// (the default `shift+tab`) is in `RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS`
+	// with `restrictOverride=true`, so registering `shift+tab` would normally
+	// be silently dropped. To free up `shift+tab` for primary cycling, users
+	// add to `~/.pi/agent/keybindings.json`:
+	//   { "app.thinking.cycle": ["ctrl+shift+tab"] }
+	// That moves thinking cycling to `ctrl+shift+tab` (a free key); after that,
+	// `getShortcuts` no longer sees `shift+tab` as reserved, and the extension
+	// binding below wins. See WP0 / O2 in docs/v2.1/design.md and the README
+	// "Primary Agents" section.
+	pi.registerShortcut(Key.shift("tab"), {
+		description: "Cycle primary agents (plan/build/custom)",
+		handler: async (ctx) => {
+			await controller.cycle(ctx);
+		},
+	});
+
+	// Thinking-level cycle — relocated to `Key.alt("t")` (free; built-in
+	// Shift+Tab still works as before, but we recommend the user remap it via
+	// keybindings.json to `ctrl+shift+tab` so this extension's Shift+Tab can
+	// take over primary cycling — see above).
+	pi.registerShortcut(Key.alt("t"), {
+		description: "Cycle thinking level",
+		handler: () => {
+			cycleThinkingLevel(pi as never);
+		},
+	});
+
+	pi.registerCommand("plan", {
+		description: "Switch to the plan primary (read-only)",
+		handler: async (_args, ctx) => {
+			await controller.apply("plan", ctx);
+		},
+	});
+
+	pi.registerCommand("build", {
+		description: "Switch to the build primary (full capability)",
+		handler: async (_args, ctx) => {
+			await controller.apply("build", ctx);
+		},
+	});
+
+	// ===========================================================================
+	// v2.1 — pi.on(...) event handlers
+	// ===========================================================================
+
+	pi.on("before_agent_start", async (event) => {
+		return controller.injectSystemPrompt({ systemPrompt: event.systemPrompt });
+	});
+
+	pi.on("model_select", async (event, ctx) => {
+		controller.onModelChanged(event.model, ctx);
+	});
+
+	pi.on("session_start", async (_event, ctx) => {
+		// Resolve primaries with discovered `type: primary` agents.
+		try {
+			const discovery = discoverAgents(ctx.cwd, "both");
+			const userPrimaries = discovery.agents.filter((a) => a.type === "primary");
+			resolvedPrimaries = resolvePrimaries(bundled, userPrimaries);
+			rebuildController();
+		} catch {
+			// Discovery failed; keep bundled-only.
+		}
+
+		// Restore: look for a `minion-primary` custom entry, fall back to --agent
+		// flag, else default "build", else the first available.
+		const restored = readRestoredPrimary(ctx);
+		const flagName = pi.getFlag("agent");
+		const availableNames = new Set(controller.list().map((p) => p.name));
+		const candidate =
+			(typeof flagName === "string" && flagName && availableNames.has(flagName)
+				? flagName
+				: null) ??
+			(restored && availableNames.has(restored) ? restored : null) ??
+			(availableNames.has("build") ? "build" : null) ??
+			controller.list()[0]?.name;
+
+		if (!candidate) {
+			// No primaries available at all — nothing to apply.
+			return;
+		}
+
+		if (
+			typeof flagName === "string" &&
+			flagName &&
+			!availableNames.has(flagName) &&
+			flagName !== "build"
+		) {
+			// Unknown --agent value: warn but fall through to the best available.
+			ctx.ui.notify(
+				`Unknown --agent "${flagName}". Falling back to "${candidate}". Available: ${[...availableNames].join(", ") || "(none)"}`,
+			);
+		}
+
+		await controller.apply(candidate, ctx);
+	});
+
+	pi.on("turn_start", async () => {
+		const active = controller.getActive();
+		if (active) {
+			pi.appendEntry("minion-primary", { name: active.name });
+		}
+	});
+
+	// ===========================================================================
+	// /minion command (v2.0 subcommands + v2.1 primary switches)
+	// ===========================================================================
+
 	pi.registerCommand("minion", {
-		description: "minion utilities (list / install-agents)",
+		description: "minion utilities (list / install-agents / primaries / plan / build / <name>)",
 		async handler(args, ctx) {
 			const trimmed = (args ?? "").trim();
 			if (trimmed === "list") {
 				const discovery = discoverAgents(ctx.cwd, "both");
-				const list = formatAgentList(discovery.agents, 50);
+				// list only shows subagents (not primaries)
+				const subagentsOnly = discovery.agents.filter(
+					(a) => a.type === "subagent" || a.type === undefined,
+				);
+				const list = formatAgentList(subagentsOnly, 50);
 				const tail = list.remaining > 0 ? ` (+${list.remaining} more)` : "";
 				ctx.ui.notify(`${list.text}${tail}`);
 				return;
@@ -237,15 +455,44 @@ export function buildExtension(pi: ExtensionAPI, deps: BuildExtensionDeps): void
 				ctx.ui.notify(`Installed bundled agents into ${dest}: ${summary}`);
 				return;
 			}
+			if (trimmed === "primaries") {
+				const names = controller.list().map((p) => `${p.name} (${p.source}): ${p.description}`).join("; ");
+				ctx.ui.notify(names || "none");
+				return;
+			}
+			if (trimmed === "plan" || trimmed === "build" || trimmed.length > 0) {
+				await controller.apply(trimmed, ctx);
+				return;
+			}
 			ctx.ui.notify(
-				"Usage: /minion list | /minion install-agents [--project]",
+				"Usage: /minion list | /minion install-agents [--project] | /minion primaries | /minion plan | /minion build | /minion <name>",
 			);
 		},
 	});
 }
 
+/** Read the most recent `minion-primary` custom entry from the session. */
+function readRestoredPrimary(ctx: ExtensionContext): string | undefined {
+	try {
+		const entries = ctx.sessionManager.getEntries() as Array<{
+			type?: string;
+			customType?: string;
+			data?: { name?: string };
+		}>;
+		for (let i = entries.length - 1; i >= 0; i--) {
+			const e = entries[i];
+			if (e && e.type === "custom" && e.customType === "minion-primary" && e.data?.name) {
+				return e.data.name;
+			}
+		}
+	} catch {
+		// Session manager not available; ignore.
+	}
+	return undefined;
+}
+
 /** Real wiring — used as the default export and for production. */
-function defaultExtension(pi: ExtensionAPI): void {
+export function defaultExtension(pi: ExtensionAPI): void {
 	buildExtension(pi, {
 		discoverAgents: realDiscoverAgents,
 		runAgentFn: (req) =>
@@ -260,7 +507,8 @@ function defaultExtension(pi: ExtensionAPI): void {
 				onUpdate: req.onUpdate,
 				makeDetails: req.makeDetails,
 			}),
-		readOverrides: realReadOverrides,
+		readOverrides: realReadAgentOverrides,
+		writeOverride: (name, patch, p) => realWriteAgentOverride(name, patch, p),
 	});
 }
 

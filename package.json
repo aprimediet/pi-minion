@@ -1,8 +1,8 @@
 {
   "name": "@aprimediet/minion",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "type": "module",
-  "description": "Lean subagent delegation for the pi coding agent — single / parallel / chain modes with isolated subprocesses.",
+  "description": "Lean subagent delegation for the pi coding agent — single / parallel / chain modes with isolated subprocesses. v2.1 adds primary-agent (plan/build) persona switching for the main loop.",
   "keywords": ["pi-package"],
   "license": "MIT",
   "publishConfig": {
@@ -25,9 +25,11 @@
     "render.ts",
     "agents.ts",
     "config.ts",
-    "runner.ts",
     "modes.ts",
+    "runner.ts",
+    "primaries.ts",
     "agents/**",
+    "primaries/**",
     "prompts/**",
     "README.md",
     "LICENSE"

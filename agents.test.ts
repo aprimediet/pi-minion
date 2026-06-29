@@ -32,6 +32,52 @@ afterEach(() => {
 	fs.rmSync(tmp, { recursive: true, force: true });
 });
 
+describe("loadAgentsFromDir — `type` frontmatter (v2.1)", () => {
+	it("defaults type to 'subagent' when absent", () => {
+		const dir = path.join(tmp, "agents");
+		fs.mkdirSync(dir);
+		fs.writeFileSync(
+			path.join(dir, "no-type.md"),
+			`---\nname: notype\ndescription: d\n---\nbody`,
+		);
+		const agents = loadAgentsFromDir(dir, "user");
+		expect(agents[0].type).toBe("subagent");
+	});
+
+	it("parses type: primary when present", () => {
+		const dir = path.join(tmp, "agents");
+		fs.mkdirSync(dir);
+		fs.writeFileSync(
+			path.join(dir, "primary.md"),
+			`---\nname: p\ndescription: d\ntype: primary\n---\nbody`,
+		);
+		const agents = loadAgentsFromDir(dir, "user");
+		expect(agents[0].type).toBe("primary");
+	});
+
+	it("parses type: subagent when explicit", () => {
+		const dir = path.join(tmp, "agents");
+		fs.mkdirSync(dir);
+		fs.writeFileSync(
+			path.join(dir, "sub.md"),
+			`---\nname: s\ndescription: d\ntype: subagent\n---\nbody`,
+		);
+		const agents = loadAgentsFromDir(dir, "user");
+		expect(agents[0].type).toBe("subagent");
+	});
+
+	it("falls back to 'subagent' for an unrecognized type value (fail-soft)", () => {
+		const dir = path.join(tmp, "agents");
+		fs.mkdirSync(dir);
+		fs.writeFileSync(
+			path.join(dir, "weird.md"),
+			`---\nname: w\ndescription: d\ntype: not-a-real-kind\n---\nbody`,
+		);
+		const agents = loadAgentsFromDir(dir, "user");
+		expect(agents[0].type).toBe("subagent");
+	});
+});
+
 describe("loadAgentsFromDir", () => {
 	it("returns [] when dir does not exist", () => {
 		expect(loadAgentsFromDir(path.join(tmp, "missing"), "user")).toEqual([]);

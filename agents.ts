@@ -19,6 +19,9 @@ export interface AgentConfig {
 	systemPrompt: string;
 	source: "user" | "project";
 	filePath: string;
+	/** v2.1: distinguishes primaries (switchable main persona) from subagents.
+	 *  Optional in frontmatter; defaults to `"subagent"` for v2.0 back-compat. */
+	type?: "primary" | "subagent";
 }
 
 export interface AgentDiscoveryResult {
@@ -59,6 +62,11 @@ export function loadAgentsFromDir(dir: string, source: "user" | "project"): Agen
 			.map((t: string) => t.trim())
 			.filter(Boolean);
 
+		// v2.1: normalize the `type` field — defaults to "subagent" and falls
+		// back fail-soft on any unrecognized value.
+		const rawType = (frontmatter.type ?? "").trim().toLowerCase();
+		const type: "primary" | "subagent" = rawType === "primary" ? "primary" : "subagent";
+
 		agents.push({
 			name: frontmatter.name,
 			description: frontmatter.description,
@@ -67,6 +75,7 @@ export function loadAgentsFromDir(dir: string, source: "user" | "project"): Agen
 			systemPrompt: body,
 			source,
 			filePath,
+			type,
 		});
 	}
 	return agents;

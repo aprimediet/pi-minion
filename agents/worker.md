@@ -1,5 +1,6 @@
 ---
 name: worker
+type: subagent
 description: General-purpose subagent with full capabilities, isolated context
 model: claude-sonnet-4-5
 ---

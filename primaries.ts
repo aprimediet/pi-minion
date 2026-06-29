@@ -1,0 +1,423 @@
+/**
+ * Primary agents (v2.1) — bundled named personas for the *main* loop that
+ * the user switches between mid-session. Mirrors opencode's plan/build split.
+ *
+ * Module layout:
+ *   `loadBundledPrimaries(dir?)`    — parses `*.md` from a directory (typically
+ *                                      the bundled `primaries/` shipped with
+ *                                      this extension).
+ *   `resolvePrimaries(bundled, discovered)` — merges bundled + user `type:
+ *                                       primary` agents; user overrides bundled
+ *                                       by name, new user primaries append.
+ *   `createPrimaryController(pi, primaries, opts?)` — owns the active-primary
+ *                                      state; applies model/tools/systemPrompt
+ *                                      via the injected `pi`, cycles, injects
+ *                                      the system prompt on every turn, and
+ *                                      persists user-chosen models into
+ *                                      `settings.json#agents[name].model`.
+ *
+ * The controller is **DI-only** — never touches the FS in production paths
+ * (the bundled dir is opt-in via `opts.bundledDir`; the writer is opt-in via
+ * `opts.writeOverride`). Tests inject a fake `pi` and an in-memory writer.
+ *
+ * WP0 decision (recorded in commit log + README): pi's built-in Shift+Tab
+ * (`app.thinking.cycle`) is in `RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS`
+ * with `restrictOverride=true`, so an extension that registers `shift+tab` is
+ * silently dropped at runtime — see `runner.js#getShortcuts`. We work around
+ * this by *user-side override*: instruct users to add to
+ * `~/.pi/agent/keybindings.json`:
+ *   { "app.thinking.cycle": ["ctrl+shift+tab"] }
+ * That moves thinking cycling to `ctrl+shift+tab` (a free key), so
+ * `getShortcuts` no longer sees `shift+tab` as reserved and the extension
+ * primary-cycle binding on `shift+tab` wins. The `alt+t` binding for thinking
+ * level remains as a belt-and-braces alternative. Mirrors what
+ * `permission-modes` does for its mode cycle. See docs/v2.1/design.md §O2.
+ */
+
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import type { Model } from "@earendil-works/pi-ai";
+import {
+	resolveAgentRuntime,
+	defaultSettingsPath,
+	readAgentOverrides,
+	writeAgentOverride,
+	type AgentOverride,
+} from "./config.ts";
+
+export type PrimarySource = "bundled" | "user" | "project";
+
+export interface PrimaryAgent {
+	name: string;
+	description: string;
+	tools?: string[];
+	model?: string;
+	systemPrompt: string;
+	source: PrimarySource;
+	filePath: string;
+}
+
+/** Parse a directory of bundled primary-agent `*.md` files. Fail-soft. */
+export function loadBundledPrimaries(dir?: string): PrimaryAgent[] {
+	const targetDir = dir ?? defaultBundledPrimariesDir();
+	const out: PrimaryAgent[] = [];
+	if (!fs.existsSync(targetDir)) return out;
+
+	let entries: fs.Dirent[];
+	try {
+		entries = fs.readdirSync(targetDir, { withFileTypes: true });
+	} catch {
+		return out;
+	}
+
+	for (const entry of entries) {
+		if (!entry.name.endsWith(".md")) continue;
+		if (!entry.isFile() && !entry.isSymbolicLink()) continue;
+
+		const filePath = path.join(targetDir, entry.name);
+		let content: string;
+		try {
+			content = fs.readFileSync(filePath, "utf-8");
+		} catch {
+			continue;
+		}
+
+		let parsed: { frontmatter: Record<string, string>; body: string };
+		try {
+			parsed = parseFrontmatter<Record<string, string>>(content);
+		} catch {
+			continue;
+		}
+		const { frontmatter, body } = parsed;
+
+		if (!frontmatter.name || !frontmatter.description) continue;
+
+		// Bundled primaries must declare `type: primary`. A missing or wrong
+		// value here is treated as a bug — but we still fail-soft and skip.
+		const rawType = (frontmatter.type ?? "").trim().toLowerCase();
+		if (rawType !== "primary") continue;
+
+		const tools = frontmatter.tools
+			?.split(",")
+			.map((t) => t.trim())
+			.filter(Boolean);
+		const toolsOrUndef = tools && tools.length > 0 ? tools : undefined;
+
+		out.push({
+			name: frontmatter.name,
+			description: frontmatter.description,
+			tools: toolsOrUndef,
+			model: frontmatter.model,
+			systemPrompt: body,
+			source: "bundled",
+			filePath,
+		});
+	}
+	return out;
+}
+
+export interface ResolvePrimariesOptions {
+	/** Bundled-only primary to keep even if a user one shadows it; default false. */
+	keepBundledOverride?: boolean;
+}
+
+/**
+ * Merge bundled + user primaries.
+ *   • Bundled primaries kept in input order (caller decides cycle order).
+ *   • A user primary with a bundled name **overrides** the bundled entry
+ *     (and stays in the same bundled position).
+ *   • New user primaries (no bundled shadow) are appended, sorted alphabetically
+ *     by name for stable cycle order.
+ */
+export function resolvePrimaries(
+	bundled: PrimaryAgent[],
+	discovered: AgentConfigLike[],
+): PrimaryAgent[] {
+	// Map of user-discovered primaries by name (filtered to `type: "primary"`).
+	const userByName = new Map<string, PrimaryAgent>();
+	for (const d of discovered) {
+		if (d.type !== "primary") continue;
+		userByName.set(d.name, {
+			name: d.name,
+			description: d.description,
+			tools: d.tools,
+			model: d.model,
+			systemPrompt: d.systemPrompt,
+			source: d.source === "project" ? "project" : "user",
+			filePath: d.filePath,
+		});
+	}
+
+	// Walk bundled in input order; user entry (if any) wins at the same slot.
+	const ordered: PrimaryAgent[] = [];
+	const seen = new Set<string>();
+	for (const b of bundled) {
+		const u = userByName.get(b.name);
+		ordered.push(u ?? b);
+		seen.add(b.name);
+	}
+
+	// Append user primaries NOT shadowing bundled, sorted alphabetically.
+	const extra = Array.from(userByName.values())
+		.filter((u) => !seen.has(u.name))
+		.sort((a, b) => a.name.localeCompare(b.name));
+	ordered.push(...extra);
+
+	return ordered;
+}
+
+// Minimal shape of an AgentConfig so this module doesn't depend on agents.ts
+// (which would be a circular dep via index.ts). Mirrors the AgentConfig subset
+// the controller actually reads.
+export interface AgentConfigLike {
+	name: string;
+	description: string;
+	tools?: string[];
+	model?: string;
+	systemPrompt: string;
+	source: "user" | "project";
+	filePath: string;
+	type?: "primary" | "subagent";
+}
+
+// =============================================================================
+// Controller
+// =============================================================================
+
+/** Subset of `ExtensionAPI` that the controller touches. Avoids a hard import. */
+export interface PrimaryControllerPi {
+	setActiveTools(tools: string[]): void;
+	setModel(model: Model<any> | string): Promise<boolean> | boolean | void;
+	getActiveTools(): string[];
+	getAllTools(): Array<{ name: string }>;
+	getThinkingLevel(): "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+	setThinkingLevel(
+		level: "off" | "minimal" | "low" | "medium" | "high" | "xhigh",
+	): void;
+	appendEntry(customType: string, data: unknown): void;
+}
+
+export interface PrimaryControllerContext {
+	hasUI: boolean;
+	cwd: string;
+	ui: { notify: (msg: string) => void; setStatus: (key: string, text: string | undefined) => void };
+	model?: Model<any>;
+	modelRegistry?: { find: (provider: string, model: string) => Model<any> | undefined };
+	sessionManager?: { getEntries: () => unknown[] };
+}
+
+export interface CreatePrimaryControllerOptions {
+	/** Default primary to apply at first session start (default: "build"). */
+	defaultName?: string;
+	/** Override path for the settings file (default: `defaultSettingsPath()`). */
+	settingsPath?: string;
+	/** Override read of `settings.json#agents` (test seam). */
+	readOverrides?: (settingsPath?: string) => Record<string, AgentOverride>;
+	/** Override write of `settings.json#agents[name]` (test seam). */
+	writeOverride?: (
+		name: string,
+		patch: { model?: string; tools?: string },
+		settingsPath?: string,
+	) => Promise<boolean> | boolean;
+	/** Override lookup of a model by id (test seam; default uses ctx.modelRegistry). */
+	resolveModel?: (id: string) => Model<any> | undefined;
+}
+
+export interface PrimaryController {
+	getActive(): PrimaryAgent | undefined;
+	list(): PrimaryAgent[];
+	apply(name: string, ctx: PrimaryControllerContext): Promise<void>;
+	cycle(ctx: PrimaryControllerContext): Promise<void>;
+	injectSystemPrompt(event: { systemPrompt: string }):
+		| { systemPrompt: string }
+		| undefined;
+	onModelChanged(model: { id: string } | Model<any>, ctx: PrimaryControllerContext): void;
+}
+
+interface Snapshot {
+	model: Model<any> | string | undefined;
+	tools: string[];
+	thinkingLevel: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+}
+
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+
+/** Create a primary-agent controller wired to the given (possibly-fake) `pi`. */
+export function createPrimaryController(
+	pi: PrimaryControllerPi,
+	primaries: PrimaryAgent[],
+	opts: CreatePrimaryControllerOptions = {},
+): PrimaryController {
+	const defaultName = opts.defaultName ?? "build";
+	const settingsPath = opts.settingsPath; // may be undefined; passed through
+	const readOverrides = opts.readOverrides ?? ((p?: string) => readOverridesDefault(p));
+	const writeOverride =
+		opts.writeOverride ??
+		((name, patch, p) => writeOverrideDefault(name, patch, p ?? defaultSettingsPath()));
+
+	const byName = new Map(primaries.map((p) => [p.name, p]));
+
+	let active: PrimaryAgent | undefined;
+	let snapshot: Snapshot | undefined;
+
+	function readOverridesDefault(p?: string): Record<string, AgentOverride> {
+		return readAgentOverrides(p ?? defaultSettingsPath());
+	}
+
+	function writeOverrideDefault(
+		name: string,
+		patch: { model?: string; tools?: string },
+		p: string,
+	): Promise<boolean> | boolean {
+		// writeAgentOverride returns Promise<boolean>; surface the value as-is
+		// to honour the WriteOverrideFn contract (sync or async).
+		return writeAgentOverride(name, patch, p);
+	}
+
+	function takeSnapshot(ctx: PrimaryControllerContext): Snapshot {
+		if (snapshot) return snapshot;
+		snapshot = {
+			model: ctx.model,
+			tools: pi.getActiveTools(),
+			thinkingLevel: pi.getThinkingLevel(),
+		};
+		return snapshot;
+	}
+
+	function resolveTargetTools(p: PrimaryAgent): string[] | undefined {
+		return p.tools;
+	}
+
+	function setToolsFor(p: PrimaryAgent, ctx: PrimaryControllerContext): void {
+		const wanted = resolveTargetTools(p);
+		if (wanted && wanted.length > 0) {
+			// Validate against the host's available toolset; drop unknown names
+			// fail-soft (mirrors preset.ts behavior).
+			const known = new Set(pi.getAllTools().map((t) => t.name));
+			const valid = wanted.filter((t) => known.has(t));
+			if (valid.length > 0) {
+				pi.setActiveTools(valid);
+			}
+		} else {
+			// No `tools` in frontmatter → restore the snapshot's full set.
+			const snap = takeSnapshot(ctx);
+			pi.setActiveTools(snap.tools);
+		}
+	}
+
+	function setModelFor(p: PrimaryAgent, ctx: PrimaryControllerContext): void {
+		const overrides = readOverrides(settingsPath);
+		const { model: resolvedModelId } = resolveAgentRuntime(
+			{ model: p.model, tools: p.tools },
+			overrides,
+			p.name,
+		);
+		if (!resolvedModelId) return; // inherit — leave host model untouched
+
+		// If the host gave us a resolver, prefer it; otherwise pass the id
+		// directly (the host's setModel handles string→Model for us). The
+		// test fake accepts any value.
+		if (opts.resolveModel) {
+			const m = opts.resolveModel(resolvedModelId);
+			if (m) {
+				void pi.setModel(m);
+				return;
+			}
+		}
+		void pi.setModel(resolvedModelId);
+	}
+
+	function updateStatus(p: PrimaryAgent | undefined, ctx: PrimaryControllerContext): void {
+		if (p) {
+			ctx.ui.setStatus("minion", `primary:${p.name}`);
+		} else {
+			ctx.ui.setStatus("minion", undefined);
+		}
+	}
+
+	function apply(name: string, ctx: PrimaryControllerContext): Promise<void> {
+		const target = byName.get(name);
+		if (!target) {
+			ctx.ui.notify(`Unknown primary "${name}". Available: ${primaries.map((p) => p.name).join(", ") || "(none)"}`);
+			return Promise.resolve();
+		}
+		// Snapshot BEFORE first switch only (so apply(build) after apply(plan)
+		// keeps plan's snapshot, not build's).
+		takeSnapshot(ctx);
+		setToolsFor(target, ctx);
+		setModelFor(target, ctx);
+		active = target;
+		updateStatus(target, ctx);
+		return Promise.resolve();
+	}
+
+	function cycle(ctx: PrimaryControllerContext): Promise<void> {
+		const order = primaries;
+		if (order.length === 0) return Promise.resolve();
+		const curIdx = active ? order.findIndex((p) => p.name === active!.name) : -1;
+		// curIdx === -1 (none active) → start at 0. Otherwise advance with wrap.
+		const nextIdx = curIdx === -1 ? 0 : (curIdx + 1) % order.length;
+		const next = order[nextIdx]!;
+		return apply(next.name, ctx);
+	}
+
+	function injectSystemPrompt(
+		event: { systemPrompt: string },
+	): { systemPrompt: string } | undefined {
+		if (!active) return undefined;
+		const body = (active.systemPrompt ?? "").trim();
+		if (!body) return undefined;
+		return { systemPrompt: `${event.systemPrompt}\n\n${body}` };
+	}
+
+	function modelId(m: { id: string } | Model<any>): string {
+		// Model from @earendil-works/pi-ai has `.id`; ModelSelectEvent.model.id.
+		return (m as { id?: string }).id ?? "";
+	}
+
+	function onModelChanged(
+		model: { id: string } | Model<any>,
+		_ctx: PrimaryControllerContext,
+	): void {
+		if (!active) return;
+		const id = modelId(model);
+		if (!id) return;
+		void writeOverride(active.name, { model: id }, settingsPath);
+	}
+
+	return {
+		getActive: () => active,
+		list: () => primaries.slice(),
+		apply,
+		cycle,
+		injectSystemPrompt,
+		onModelChanged,
+	};
+}
+
+// ----------------------------------------------------------------------------
+// Internal helpers
+// ----------------------------------------------------------------------------
+
+function defaultBundledPrimariesDir(): string {
+	const here =
+		typeof import.meta.dirname === "string"
+			? import.meta.dirname
+			: path.dirname(fileURLToPath(import.meta.url));
+	return path.join(here, "primaries");
+}
+
+// ----------------------------------------------------------------------------
+// Optional helper: cycle thinking level on Alt+T (used by index.ts).
+// ----------------------------------------------------------------------------
+
+/** Cycle through the canonical pi thinking-level list, wrapping. */
+export function cycleThinkingLevel(pi: PrimaryControllerPi): void {
+	const cur = pi.getThinkingLevel();
+	const idx = THINKING_LEVELS.indexOf(cur);
+	const next = THINKING_LEVELS[(idx + 1) % THINKING_LEVELS.length] as ThinkingLevel;
+	pi.setThinkingLevel(next);
+}

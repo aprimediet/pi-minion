@@ -76,6 +76,82 @@ Resolution per field, first hit wins:
 
 The settings file is read fresh per invocation, so edits apply live.
 
+## Primary agents (v2.1)
+
+On top of the subagent tool, minion v2.1 ships **primary agents** — named
+personas for the *main* loop. Two are bundled and always loaded:
+
+- **`build`** — full-capability execution mode (default at session start).
+- **`plan`** — read-only planning mode (no `edit`/`write`/`bash`).
+
+Switch the active primary:
+
+| Way                              | Effect                                                           |
+| -------------------------------- | ---------------------------------------------------------------- |
+| `Shift+Tab`                      | Cycle through bundled + user primaries                           |
+| `Alt+T`                          | Cycle thinking level                                             |
+| `/plan` / `/build`               | Jump directly to the named primary                               |
+| `/minion plan` / `/minion build` | Same, via the `/minion` command                                  |
+| `/minion <name>`                 | Switch to a custom primary by name                               |
+| `pi -e ./index.ts --agent plan`  | Start the session with `plan` active                             |
+
+`Shift+Tab` is the O2 target per [docs/v2.1/design.md](./docs/v2.1/design.md) §O2,
+but pi's built-in `app.thinking.cycle` (`shift+tab` by default) is in
+`RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS` with `restrictOverride=true`,
+so a naive `registerShortcut("shift+tab", …)` is silently dropped at
+runtime. To free the key for primary cycling, add this to
+`~/.pi/agent/keybindings.json`:
+
+```json
+{
+  "app.thinking.cycle": ["ctrl+shift+tab"]
+}
+```
+
+That moves thinking-level cycling to `Ctrl+Shift+Tab` (a free key). After
+that, the extension's `Shift+Tab` binding wins and the primary cycle
+becomes active. `Alt+T` (this extension) remains as a free-thinking-level
+alternative. See [docs/v2.1/design.md](./docs/v2.1/design.md) §O2 and the
+WP0 decision note in [primaries.ts](./primaries.ts) for the rationale.
+
+### Defining your own primary
+
+A primary is just an agent file with `type: primary` in its frontmatter.
+Drop a `*.md` into `~/.pi/agent/agents/` (or `<cwd>/.pi/agents/`):
+
+```markdown
+---
+name: research
+type: primary
+description: Read-only research mode — gather notes, propose next steps.
+tools: read, grep, find, ls
+---
+
+You are in RESEARCH MODE. ...
+```
+
+The new file becomes part of the `Shift+Tab` cycle and shows up in
+`/minion primaries`. User primaries override bundled ones **by name** (e.g.
+a user `~/.pi/agent/agents/build.md` replaces the bundled `build`); new
+names append to the cycle.
+
+### Persisting a model choice for a primary
+
+When you change the model while a primary is active, minion writes the
+choice to `~/.pi/agent/settings.json` so the next session picks up where
+you left off:
+
+```json
+{
+  "agents": {
+    "plan": { "model": "claude-opus-4-5" }
+  }
+}
+```
+
+Resolution for `apply(name)` is `settings.json#agents[name]` → frontmatter
+→ inherit the user's current model.
+
 ## Breaking change vs v1
 
 `@aprimediet/minion` v2 is a **deliberate scope reduction**:
@@ -88,7 +164,7 @@ The settings file is read fresh per invocation, so edits apply live.
 
 What stays: the same delegation engine you already know, but split into small
 single-responsibility modules (`schema` / `agents` / `config` / `runner` /
-`modes` / `render` / `index`), each unit-tested in isolation.
+`modes` / `render` / `primaries` / `index`), each unit-tested in isolation.
 
 If you still want todos, install alongside:
 
