@@ -298,3 +298,127 @@ event handler reads it or the post-setMicrotask fires — whichever happens firs
 | 1 | `apply("plan")` with deferred model_select callback → `writeOverride` NOT called | Guard suppresses programmatic set |
 | 2 | `apply()` + manual `onModelChanged` from user → `writeOverride` IS called | User-initiated persists |
 | 3 | `apply()` then manual `onModelChanged` with different model → guard is reset | Per-call scoped, not sticky |
+
+## 9. v2.1.2 — Persistent primary marker (LLM mode awareness)
+
+### The gap
+
+When the user switches from `build` (full tools) → `plan` (read-only), the
+`setActiveTools` call removes `edit`/`write`/`bash` immediately. The system prompt
+gets re-injected with `plan.md` body on the next `before_agent_start`. But the
+**conversation history** still shows the previous turn's `edit`/`write` tool calls
+and the LLM-generated response text from build mode.
+
+A "naive" LLM looking at its full input on the next turn sees:
+
+1. System prompt: "You are in PLANNING MODE..."
+2. Recent history: "[assistant] called edit on file X, called bash, called write..."
+
+The system prompt wins (it's authoritative), but **explicit anchoring** in the
+conversation prevents ambiguity from creeping into long sessions — and gives
+humans reading scrollback a visual breadcrumb of when the mode changed.
+
+### Approach (mirrors `examples/extensions/plan-mode`)
+
+pi's `BeforeAgentStartEventResult` and `ContextEvent` together provide a clean
+mechanism for persisting mode state in the conversation:
+
+1. **`pi.sendMessage(...)`** injects a custom message with `display: false` so
+   it appears in the LLM's context but NOT in the user's scrollback.
+2. **`pi.on("context")`** filters stale markers out when the active primary
+   changes, so only the current marker remains.
+
+Pattern (the pi-canonical way, from `examples/extensions/plan-mode/index.ts`):
+
+```ts
+// On primary switch:
+pi.sendMessage({
+    customType: "minion-primary-context",
+    content: `[MINION PRIMARY: plan]
+Read-only mode. Available tools: read, grep, find, ls.
+NOT available: edit, write, bash (the LLM cannot call these tools this turn).`,
+    display: false,  // LLM sees it; user does not
+}, { triggerTurn: false });
+
+// On every LLM call (context event):
+pi.on("context", (event) => {
+    // Strip stale `minion-primary-context` messages; the latest one (just
+    // injected by sendMessage at switch time) survives.
+    const filtered = event.messages.filter((m) => {
+        const c = (m as { customType?: string }).customType;
+        return c !== "minion-primary-context";
+    });
+    return { messages: filtered };
+});
+```
+
+Wait — if `context` filters ALL `minion-primary-context` messages, we wipe
+the marker every turn. So filtering must be selective: keep the LATEST one
+(matching current primary) and drop older ones.
+
+Refined: in `filterContextMessages`, keep only the **last** `minion-primary-context`
+message AND only if its `content` contains the current primary's name.
+Alternately, the marker contains the primary name explicitly, so we can match
+on content prefix.
+
+### Final design
+
+- `apply(name, ctx)` calls `pi.sendMessage(...)` once, fire-and-forget.
+  The marker tags `customType: "minion-primary-context"`, embeds the active
+  primary name + tool allowlist in content, sets `display: false`.
+
+- The `context` event handler (`filterContextMessages(messages)`) keeps at
+  most ONE `minion-primary-context` message: the one matching the current
+  active primary. Anything older (from previous switches) is stripped.
+
+This guarantees:
+- The LLM sees exactly ONE current-mode marker per turn (clean signal).
+- Humans reading scrollback don't see the markers (`display: false`).
+- The marker includes the explicit tool allowlist so the LLM doesn't have to
+  infer "what tools are active" from previous turns' usage patterns.
+
+### Sample marker content
+
+For `plan` primary:
+```
+[MINION PRIMARY: plan]
+Read-only planning mode. Available tools: read, grep, find, ls.
+NOT available: edit, write, bash. The LLM CANNOT call these tools this turn.
+```
+
+For `build` primary:
+```
+[MINION PRIMARY: build]
+Implementation mode. All standard tools are available.
+```
+
+The "NOT available" phrasing directly addresses the user's concern that the
+LLM might still try to use old-mode tools after a switch.
+
+### Edge cases
+
+1. **First session start** — no marker exists. The `context` filter is a no-op.
+2. **Switch during in-flight LLM call** — pi serializes LLM calls, so this
+   can't happen. The marker only updates between turns.
+3. **Plan-mode with disabled tools (not just restricted)** — out of scope for
+   v2.1; the simpler "tool list change" model is enough for v2.1.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `primaries.ts` | Add `sendMessage` to `PrimaryControllerPi`; call it in `apply()` with triggerTurn=false; add `filterContextMessages` method on `PrimaryController`; export `PRIMARY_MARKER_CUSTOMTYPE` const for index.ts + tests |
+| `index.ts` | Add `pi.on("context", ...)` handler calling `controller.filterContextMessages(event.messages)` |
+| `primaries.test.ts` | Update fake Pi to record `sendMessage` calls; add tests for marker content + filter logic |
+| `docs/v2.1.1/design.md` | This section (§9) |
+
+### Test plan
+
+| # | Test | Coverage |
+|---|------|----------|
+| 1 | `apply("plan")` calls `sendMessage` with marker content containing primary name + tool list | Marker injection on switch |
+| 2 | `apply("plan")` after `apply("build")` keeps only the plan marker in filtered messages | Switch replaces old marker |
+| 3 | `filterContextMessages` drops all `minion-primary-context` messages EXCEPT the current one | Filter is correct |
+| 4 | `filterContextMessages` with no active primary drops all markers | No-active fallback |
+| 5 | `sendMessage` fails fail-soft (no throw, primary still applied) | Robustness |
+| 6 | Existing tests still pass | Regression |

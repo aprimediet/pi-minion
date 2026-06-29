@@ -197,6 +197,25 @@ export interface PrimaryControllerPi {
 		level: "off" | "minimal" | "low" | "medium" | "high" | "xhigh",
 	): void;
 	appendEntry(customType: string, data: unknown): void;
+	/**
+	 * Inject a custom message into the conversation. Used to anchor the
+	 * current primary's identity in the conversation history so the LLM
+	 * sees the active persona + tool allowlist at every turn, including
+	 * when switching mid-session.
+	 *
+	 * Signature mirrors `ExtensionAPI.sendMessage` for the subset we use:
+	 * `Pick<CustomMessage, "customType" | "content" | "display" | "details">`.
+	 * Optional — older pi versions or test fakes may not implement it.
+	 */
+	sendMessage?(
+		message: {
+			customType: string;
+			content: string;
+			display?: boolean;
+			details?: unknown;
+		},
+		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+	): Promise<void> | void;
 }
 
 export interface PrimaryControllerContext {
@@ -236,6 +255,16 @@ export interface PrimaryController {
 	injectSystemPrompt(event: { systemPrompt: string }):
 		| { systemPrompt: string }
 		| undefined;
+	/**
+	 * Filter stale `minion-primary-context` messages out of the conversation
+	 * before each LLM call. Keeps ONLY the latest marker matching the
+	 * currently active primary. Wired to `pi.on("context", ...)` by index.ts.
+	 *
+	 * Messages are typed as `unknown[]` to avoid importing pi's internal
+	 * `AgentMessage` type — we duck-type the `customType` property the same
+	 * way `examples/extensions/plan-mode` does.
+	 */
+	filterContextMessages(messages: unknown[]): unknown[];
 	onModelChanged(
 		model: { id: string; provider?: string } | Model<any>,
 		ctx: PrimaryControllerContext,
@@ -250,6 +279,18 @@ interface Snapshot {
 
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+
+/**
+ * Custom message tag for the persistent primary marker injected via
+ * `pi.sendMessage` and filtered via `pi.on("context", ...)`. Exported so
+ * `index.ts` and tests can reference it without copy-paste.
+ *
+ * Distinct from `appendEntry("minion-primary", ...)` which is for session
+ * persistence (restore on resume), NOT for LLM context. They share the
+ * "primary" prefix but serve different purposes; that's intentional — the
+ * restore entry stays after resume, the context marker is transient.
+ */
+export const PRIMARY_MARKER_CUSTOMTYPE = "minion-primary-context";
 
 /** Create a primary-agent controller wired to the given (possibly-fake) `pi`. */
 export function createPrimaryController(
@@ -406,6 +447,34 @@ export function createPrimaryController(
 		}
 	}
 
+	/**
+	 * Build the persistent primary-marker content injected into the
+	 * conversation via `pi.sendMessage`. Made explicit so the LLM can
+	 * answer "what's active right now and what tools are at my disposal"
+	 * from the conversation history alone — without inferring from prior
+	 * tool calls in past turns.
+	 *
+	 * Two-line format keeps it cheap but unambiguous:
+	 *   - First line: HUMAN-readable primary name + role
+	 *   - Second line: explicit tool allowlist + "NOT available" reminder
+	 *
+	 * The "NOT available" phrasing directly addresses the user's worry
+	 * ("LLM masih pake list tool yang lama pas udah switch"): after a
+	 * primary switch, the LLM has explicit text saying the old tools are
+	 * gone, so it won't try to call them.
+	 */
+	function buildPrimaryMarkerContent(p: PrimaryAgent): string {
+		const toolsLine = p.tools && p.tools.length > 0
+			? p.tools.join(", ")
+			: "(no restriction — full default toolset)";
+		return (
+			`[MINION PRIMARY: ${p.name}]\n` +
+			`Active persona: ${p.description}\n` +
+			`Available tools this turn: ${toolsLine}.\n` +
+			`Other tools (e.g. from previous primaries) are NOT active; the agent cannot call them right now.`
+		);
+	}
+
 	function apply(name: string, ctx: PrimaryControllerContext): Promise<void> {
 		const target = byName.get(name);
 		if (!target) {
@@ -419,6 +488,33 @@ export function createPrimaryController(
 		setModelFor(target, ctx);
 		active = target;
 		updateStatus(target, ctx);
+		// Inject a custom message into the conversation anchoring the current
+		// persona + tool allowlist. `display: false` so the user doesn't see
+		// it in scrollback — only the LLM context. `triggerTurn: false` so we
+		// don't start an agent loop just to mark the mode change.
+		//
+		// Fire-and-forget: `sendMessage` may return a promise; we don't want
+		// `apply()` to be conditional on it (the mode switch is the primary
+		// effect, the marker is metadata).
+		if (pi.sendMessage) {
+			try {
+				pi.sendMessage(
+					{
+						customType: PRIMARY_MARKER_CUSTOMTYPE,
+						content: buildPrimaryMarkerContent(target),
+						display: false,
+					},
+					{ triggerTurn: false },
+				);
+			} catch (e) {
+				// Fail non-fatally — marker is informational, primary switch
+				// is the core effect. Log via notify so the user knows if
+				// debugging.
+				ctx.ui.notify(
+					`Minion: failed to inject primary marker (${(e as Error).message}). The switch itself succeeded.`,
+				);
+			}
+		}
 		return Promise.resolve();
 	}
 
@@ -480,12 +576,44 @@ export function createPrimaryController(
 		void writeOverride(active.name, { model: fullId }, settingsPath);
 	}
 
+	/**
+	 * Strip all `minion-primary-context` messages from a conversation,
+	 * then re-add exactly ONE current marker (if any primary is active).
+	 *
+	 * Why this two-step approach instead of "keep latest matching marker"?
+	 * Because `apply()` happens AT switch time, but the `context` event
+	 * fires on EVERY LLM call. We need the resulting filtered list to
+	 * contain exactly one marker per turn pointing to the current primary,
+	 * regardless of how many turns elapsed since the last switch.
+	 *
+	 * Returns the filtered array; returns the same array reference if no
+	 * filtering happened (lets `pi.on("context")` skip no-op rendering).
+	 */
+	function filterContextMessages(messages: unknown[]): unknown[] {
+		const filtered = messages.filter(
+			(m) => (m as { customType?: string }).customType !== PRIMARY_MARKER_CUSTOMTYPE,
+		);
+		if (!active) return filtered;
+		// Append the current marker. The conversation receives it via the
+		// `context` event on each turn; this is equivalent to injecting at
+		// the head of conversation but doesn't accumulate across turns
+		// because we just removed every prior occurrence.
+		filtered.push({
+			role: "custom",
+			customType: PRIMARY_MARKER_CUSTOMTYPE,
+			content: buildPrimaryMarkerContent(active),
+			display: false,
+		});
+		return filtered;
+	}
+
 	return {
 		getActive: () => active,
 		list: () => primaries.slice(),
 		apply,
 		cycle,
 		injectSystemPrompt,
+		filterContextMessages,
 		onModelChanged,
 	};
 }

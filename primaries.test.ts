@@ -71,6 +71,7 @@ function fakePi() {
 		setThinkingLevel: [] as string[],
 		appendEntry: [] as Array<{ type: string; data: unknown }>,
 		notify: [] as string[],
+		sendMessage: [] as Array<{ customType: string; content: string; display?: boolean; options?: { triggerTurn?: boolean } }>,
 		getActiveTools: vi.fn(() => ["read", "bash", "edit", "write"]),
 		getAllTools: vi.fn(() => [
 			{ name: "read" },
@@ -95,6 +96,9 @@ function fakePi() {
 		getThinkingLevel: calls.getThinkingLevel,
 		setThinkingLevel: vi.fn((level: string) => calls.setThinkingLevel.push(level)),
 		appendEntry: vi.fn((type: string, data: unknown) => calls.appendEntry.push({ type, data })),
+		sendMessage: vi.fn((message: { customType: string; content: string; display?: boolean }, options?: { triggerTurn?: boolean }) => {
+			calls.sendMessage.push({ ...message, options });
+		}),
 	} satisfies PrimaryControllerPi;
 	return { pi, calls };
 }
@@ -625,5 +629,146 @@ describe("createPrimaryController", () => {
 		const c = createPrimaryController(pi, primaries);
 		await c.apply("build", fakeCtx());
 		expect(c.getActive()?.name).toBe("build");
+	});
+
+	// ===========================================================================
+	// v2.1.2 — Mode awareness (persistent primary marker).
+	//
+	// The controller now injects a custom message via `pi.sendMessage` on every
+	// `apply()` so the LLM has an explicit anchor in the conversation for which
+	// primary is active and what tools are available. The `pi.on("context")`
+	// handler wired in index.ts filters stale markers via
+	// `filterContextMessages`. These tests verify both halves in isolation.
+	// ===========================================================================
+
+	it("apply('plan') calls pi.sendMessage with marker tagged as minion-primary-context", async () => {
+		const { pi, calls } = fakePi();
+		const c = createPrimaryController(pi, primaries, { defaultName: "build" });
+		await c.apply("plan", fakeCtx());
+		expect(calls.sendMessage.length).toBe(1);
+		const msg = calls.sendMessage[0]!;
+		expect(msg.customType).toBe("minion-primary-context");
+		expect(msg.display).toBe(false); // hidden from user scrollback
+		expect(msg.content).toContain("[MINION PRIMARY: plan]");
+	});
+
+	it("apply() marker content includes primary's tool allowlist", async () => {
+		const { pi, calls } = fakePi();
+		const c = createPrimaryController(pi, primaries, { defaultName: "build" });
+		await c.apply("plan", fakeCtx());
+		const msg = calls.sendMessage[0]!;
+		// plan primary lists read, grep, find, ls in tools
+		expect(msg.content).toContain("read");
+		expect(msg.content).toContain("grep");
+		expect(msg.content).toContain("find");
+		expect(msg.content).toContain("ls");
+		// And explicitly states that edit/write are NOT active (user's concern).
+		expect(msg.content).toMatch(/NOT active/i);
+	});
+
+	it("apply() marker uses triggerTurn:false so it doesn't start an agent loop", async () => {
+		const { pi, calls } = fakePi();
+		const c = createPrimaryController(pi, primaries, { defaultName: "build" });
+		await c.apply("plan", fakeCtx());
+		expect(calls.sendMessage[0]!.options?.triggerTurn).toBe(false);
+	});
+
+	it("apply() to a different primary injects a NEW marker (one per switch)", async () => {
+		const { pi, calls } = fakePi();
+		const c = createPrimaryController(pi, primaries, { defaultName: "build" });
+		await c.apply("plan", fakeCtx());
+		await c.apply("build", fakeCtx());
+		expect(calls.sendMessage.length).toBe(2);
+		expect(calls.sendMessage[0]!.content).toContain("[MINION PRIMARY: plan]");
+		expect(calls.sendMessage[1]!.content).toContain("[MINION PRIMARY: build]");
+	});
+
+	it("apply() still succeeds when pi.sendMessage is absent (fail-soft)", async () => {
+		// Backward compatibility: older pi versions or test fakes without
+		// sendMessage should still let the primary switch happen.
+		const { pi, calls } = fakePi();
+		// Strip sendMessage via Object.defineProperty (Cannot `delete` from
+		// satisfies-checked object; clone and rebuild without it).
+		const piNoSend = { ...pi } as PrimaryControllerPi & { sendMessage?: unknown };
+		delete (piNoSend as { sendMessage?: unknown }).sendMessage;
+		const c = createPrimaryController(piNoSend, primaries, { defaultName: "build" });
+		await c.apply("plan", fakeCtx());
+		expect(calls.sendMessage.length).toBe(0); // never called
+		expect(c.getActive()?.name).toBe("plan"); // but switch still worked
+	});
+
+	it("filterContextMessages drops all stale minion-primary-context messages", async () => {
+		const { pi } = fakePi();
+		const c = createPrimaryController(pi, primaries, { defaultName: "build" });
+		await c.apply("plan", fakeCtx());
+		const messages = [
+			{ role: "user", content: "hi" },
+			{
+				role: "custom",
+				customType: "minion-primary-context",
+				content: "[MINION PRIMARY: build]\nold marker",
+				display: false,
+			},
+			{
+				role: "custom",
+				customType: "minion-primary-context",
+				content: "[MINION PRIMARY: plan]\nold marker",
+				display: false,
+			},
+			{ role: "assistant", content: "hello" },
+		];
+		const filtered = c.filterContextMessages(messages);
+		// Expect exactly ONE minion-primary-context — the current primary's
+		const markers = filtered.filter((m) => (m as { customType?: string }).customType === "minion-primary-context");
+		expect(markers.length).toBe(1);
+		expect((markers[0] as { content: string }).content).toContain("[MINION PRIMARY: plan]");
+		// Other messages untouched
+		expect(filtered.length).toBe(3); // user + 1 marker + assistant
+	});
+
+	it("filterContextMessages appends current primary's marker when none present", async () => {
+		const { pi } = fakePi();
+		const c = createPrimaryController(pi, primaries, { defaultName: "build" });
+		await c.apply("plan", fakeCtx());
+		const messages = [
+			{ role: "user", content: "hi" },
+			{ role: "assistant", content: "hello" },
+		];
+		const filtered = c.filterContextMessages(messages);
+		const markers = filtered.filter((m) => (m as { customType?: string }).customType === "minion-primary-context");
+		expect(markers.length).toBe(1);
+		expect((markers[0] as { content: string }).content).toContain("[MINION PRIMARY: plan]");
+	});
+
+	it("filterContextMessages with no active primary drops all markers", async () => {
+		const { pi } = fakePi();
+		const c = createPrimaryController(pi, primaries, { defaultName: "build" });
+		// Note: no apply() call — active is undefined
+		const messages = [
+			{
+				role: "custom",
+				customType: "minion-primary-context",
+				content: "[MINION PRIMARY: plan]",
+				display: false,
+			},
+			{ role: "user", content: "hi" },
+		];
+		const filtered = c.filterContextMessages(messages);
+		const markers = filtered.filter((m) => (m as { customType?: string }).customType === "minion-primary-context");
+		expect(markers.length).toBe(0);
+		expect(filtered.length).toBe(1); // only user msg survives
+	});
+
+	it("filterContextMessages leaves non-marker messages untouched", async () => {
+		const { pi } = fakePi();
+		const c = createPrimaryController(pi, primaries, { defaultName: "build" });
+		await c.apply("plan", fakeCtx());
+		const userMsg = { role: "user", content: "hi" };
+		const asstMsg = { role: "assistant", content: "hello" };
+		const filtered = c.filterContextMessages([userMsg, asstMsg]);
+		// user + assistant + 1 marker = 3
+		expect(filtered.length).toBe(3);
+		expect(filtered[0]).toBe(userMsg);
+		expect(filtered[1]).toBe(asstMsg);
 	});
 });

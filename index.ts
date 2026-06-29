@@ -367,6 +367,19 @@ export function buildExtension(pi: ExtensionAPI, deps: BuildExtensionDeps): void
 		return controller.injectSystemPrompt({ systemPrompt: event.systemPrompt });
 	});
 
+	// v2.1.2 — Mode-awareness: inject a custom message at the head of the
+	// conversation listing the active primary + tool allowlist, so the LLM
+	// has an explicit anchor for "what mode am I in *right now*". Companion
+	// to `controller.apply()` which only `sendMessage`s on switch — the
+	// `context` filter is what keeps the marker consistent (one and only
+	// one per turn) and drops stale markers from previous primaries.
+	//
+	// Reference: pi's `examples/extensions/plan-mode` does the same pattern
+	// with `pi.on("context", ...)`. See docs/v2.1.1/design.md §9.
+	pi.on("context", async (event) => {
+		return { messages: controller.filterContextMessages(event.messages) };
+	});
+
 	pi.on("model_select", async (event, ctx) => {
 		controller.onModelChanged(event.model, ctx);
 	});
