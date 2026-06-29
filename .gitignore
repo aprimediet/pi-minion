@@ -38,6 +38,7 @@ yarn-error.log*
 # Runtime data managed by minion itself (see AGENTS.md "Boundaries")
 .pi/projects/
 .pi/self-taught/
+.pi/tmp
 
 # npm cache (in case it's tracked at root by mistake)
 .npm/

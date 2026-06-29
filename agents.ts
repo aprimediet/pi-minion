@@ -1,18 +1,15 @@
 /**
- * Agent discovery (bundled + user + project) and per-agent model resolution.
+ * Agent discovery + frontmatter parsing.
  *
- * Extends pi's bundled subagent example with:
- *  - a third "bundled" source (the agents shipped inside this extension),
- *  - per-agent model config read from minion.json (project then global).
+ * Loads `*.md` files from `<agentDir>/agents` (user) and the nearest `.pi/agents`
+ * walking up from cwd (project). In `both` scope, project overrides user by name.
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import { CONFIG_DIR_NAME, getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 
 export type AgentScope = "user" | "project" | "both";
-export type AgentSource = "bundled" | "user" | "project";
 
 export interface AgentConfig {
 	name: string;
@@ -20,7 +17,7 @@ export interface AgentConfig {
 	tools?: string[];
 	model?: string;
 	systemPrompt: string;
-	source: AgentSource;
+	source: "user" | "project";
 	filePath: string;
 }
 
@@ -29,19 +26,8 @@ export interface AgentDiscoveryResult {
 	projectAgentsDir: string | null;
 }
 
-const HERE =
-	typeof import.meta.dirname === "string" ? import.meta.dirname : path.dirname(fileURLToPath(import.meta.url));
-const BUNDLED_AGENTS_DIR = path.join(HERE, "agents");
-const BUNDLED_MODELS_FILE = path.join(HERE, "minion.json");
-
-export function bundledAgentsDir(): string {
-	return BUNDLED_AGENTS_DIR;
-}
-export function bundledModelsFile(): string {
-	return BUNDLED_MODELS_FILE;
-}
-
-function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
+/** Parse a single directory of agent `*.md` files. Skips files lacking `name` or `description`. */
+export function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig[] {
 	const agents: AgentConfig[] = [];
 	if (!fs.existsSync(dir)) return agents;
 
@@ -65,6 +51,7 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 		}
 
 		const { frontmatter, body } = parseFrontmatter<Record<string, string>>(content);
+
 		if (!frontmatter.name || !frontmatter.description) continue;
 
 		const tools = frontmatter.tools
@@ -93,131 +80,61 @@ function isDirectory(p: string): boolean {
 	}
 }
 
-function findNearestProjectAgentsDir(cwd: string): string | null {
-	let dir = cwd;
-	for (;;) {
-		const candidate = path.join(dir, CONFIG_DIR_NAME, "agents");
+/** Walk up from cwd until a `.pi/agents` directory is found, or return null. */
+export function findNearestProjectAgentsDir(cwd: string): string | null {
+	let currentDir = cwd;
+	while (true) {
+		const candidate = path.join(currentDir, CONFIG_DIR_NAME, "agents");
 		if (isDirectory(candidate)) return candidate;
-		const parent = path.dirname(dir);
-		if (parent === dir) return null;
-		dir = parent;
+
+		const parentDir = path.dirname(currentDir);
+		if (parentDir === currentDir) return null;
+		currentDir = parentDir;
 	}
 }
 
-/** bundled (always) → user (unless scope==="project") → project (scope project|both). Later wins. */
-export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryResult {
-	const userDir = path.join(getAgentDir(), "agents");
+export interface DiscoverAgentsOptions {
+	/** Override the user-agents directory (default: `<agentDir>/agents`). */
+	userAgentsDir?: string;
+}
+
+/** Discover agents for the given cwd + scope. `both` merges with project overriding user by name. */
+export function discoverAgents(
+	cwd: string,
+	scope: AgentScope,
+	options: DiscoverAgentsOptions = {},
+): AgentDiscoveryResult {
+	const userDir = options.userAgentsDir ?? path.join(getAgentDir(), "agents");
 	const projectAgentsDir = findNearestProjectAgentsDir(cwd);
 
-	const bundled = loadAgentsFromDir(BUNDLED_AGENTS_DIR, "bundled");
 	const userAgents = scope === "project" ? [] : loadAgentsFromDir(userDir, "user");
-	const projectAgents = scope === "user" || !projectAgentsDir ? [] : loadAgentsFromDir(projectAgentsDir, "project");
+	const projectAgents =
+		scope === "user" || !projectAgentsDir ? [] : loadAgentsFromDir(projectAgentsDir, "project");
 
-	const map = new Map<string, AgentConfig>();
-	for (const a of bundled) map.set(a.name, a);
-	for (const a of userAgents) map.set(a.name, a);
-	for (const a of projectAgents) map.set(a.name, a);
+	const agentMap = new Map<string, AgentConfig>();
 
-	return { agents: Array.from(map.values()), projectAgentsDir };
+	if (scope === "both") {
+		for (const agent of userAgents) agentMap.set(agent.name, agent);
+		for (const agent of projectAgents) agentMap.set(agent.name, agent);
+	} else if (scope === "user") {
+		for (const agent of userAgents) agentMap.set(agent.name, agent);
+	} else {
+		for (const agent of projectAgents) agentMap.set(agent.name, agent);
+	}
+
+	return { agents: Array.from(agentMap.values()), projectAgentsDir };
 }
 
-/**
- * Build the "Subagent delegation" section appended to pi's system prompt each turn, so the main
- * agent always knows it can delegate and which agents exist. Lists the agents usable by default
- * (bundled + user); notes project-local agents (which require agentScope:"both"). Returns null
- * when no agents are discovered.
- */
-export function buildDelegationSystemPrompt(cwd: string): string | null {
-	let discovery: AgentDiscoveryResult;
-	try {
-		discovery = discoverAgents(cwd, "both");
-	} catch {
-		return null;
-	}
-	if (discovery.agents.length === 0) return null;
-
-	const usable = discovery.agents.filter((a) => a.source !== "project");
-	const project = discovery.agents.filter((a) => a.source === "project");
-
-	const fmt = (a: AgentConfig): string => {
-		const desc = a.description.replace(/\s+/g, " ").trim();
-		const short = desc.length > 140 ? `${desc.slice(0, 140)}…` : desc;
-		return `- ${a.name} — ${short}`;
-	};
-
-	const lines = [
-		"# Subagent delegation",
-		"",
-		"You can delegate work to specialized subagents with the `subagent` tool. Each subagent runs in its own isolated context window, so delegating keeps your context focused. Delegate well-scoped work that benefits from focused expertise or parallelism — broad code exploration, planning, code review, debugging, writing tests or docs — and decide for yourself when it is worthwhile (do trivial steps directly).",
-		"",
-		"Modes: single (one `agent` + `task`), parallel (a `tasks` array of independent jobs run at once), and chain (a `chain` array run sequentially, referencing the previous step's output with the {previous} placeholder).",
-		"",
-		"Available agents (call by exact name):",
-		...usable.map(fmt),
-	];
-	if (project.length > 0) {
-		lines.push("");
-		lines.push(
-			`Project-local agents (trusted repos only; pass agentScope:"both" to use): ${project.map((a) => a.name).join(", ")}.`,
-		);
-	}
-	return lines.join("\n");
-}
-
-export function formatAgentList(agents: AgentConfig[], maxItems: number): { text: string; remaining: number } {
+/** Render an agent roster as `name (source): description; …` with a `+N more` remainder. */
+export function formatAgentList(
+	agents: AgentConfig[],
+	maxItems: number,
+): { text: string; remaining: number } {
 	if (agents.length === 0) return { text: "none", remaining: 0 };
 	const listed = agents.slice(0, maxItems);
+	const remaining = agents.length - listed.length;
 	return {
 		text: listed.map((a) => `${a.name} (${a.source}): ${a.description}`).join("; "),
-		remaining: agents.length - listed.length,
+		remaining,
 	};
-}
-
-// ------------------------------------------------------- per-agent model config
-
-let flagDefaultModel: string | undefined;
-export function setDefaultAgentModel(model: string | undefined): void {
-	flagDefaultModel = model && model.trim() ? model.trim() : undefined;
-}
-
-function findNearestProjectModelsFile(cwd: string): string | null {
-	let dir = cwd;
-	for (;;) {
-		const candidate = path.join(dir, CONFIG_DIR_NAME, "minion.json");
-		if (fs.existsSync(candidate)) return candidate;
-		const parent = path.dirname(dir);
-		if (parent === dir) return null;
-		dir = parent;
-	}
-}
-
-function readModels(file: string | null): Record<string, string> | undefined {
-	if (!file) return undefined;
-	try {
-		const parsed = JSON.parse(fs.readFileSync(file, "utf-8")) as { models?: Record<string, string> };
-		return parsed?.models;
-	} catch {
-		return undefined;
-	}
-}
-
-/**
- * Resolve the model for an agent (first hit wins):
- *   project models[name] → global models[name] → project models["*"] → global models["*"]
- *   → frontmatter model → MINION_DEFAULT_MODEL / --default-agent-model → undefined.
- * Re-reads the JSON each call so edits apply without a reload.
- */
-export function resolveAgentModel(agent: AgentConfig, cwd: string): string | undefined {
-	const proj = readModels(findNearestProjectModelsFile(cwd));
-	const glob = readModels(path.join(getAgentDir(), "minion.json"));
-	return (
-		proj?.[agent.name] ??
-		glob?.[agent.name] ??
-		proj?.["*"] ??
-		glob?.["*"] ??
-		agent.model ??
-		process.env.MINION_DEFAULT_MODEL ??
-		flagDefaultModel ??
-		undefined
-	);
 }

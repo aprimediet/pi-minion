@@ -1,97 +1,101 @@
 # @aprimediet/minion
 
-Claude-Code-style **delegation** for the [pi coding agent](https://www.npmjs.com/package/@earendil-works/pi-coding-agent): a `subagent` (Task) tool that runs work in isolated `pi` subprocesses, a **persistent kanban task board** for cross-session delegation, and a **bundled library of 12 specialized agents** with per-agent model configuration.
+> Lean subagent delegation for the [pi coding agent](https://github.com/earendil-works/pi-coding-agent).
+> Each subagent runs in an isolated subprocess with its own context window.
 
-> **v1.1.0 breaking change:** the `todo_write` tool and `/todos` command have been
-> extracted into `@aprimediet/todo`. Install alongside minion:
-> `pi install npm:@aprimediet/todo`.
+## What it does
 
-pi is also made **aware of its delegation capability and the agent roster** every turn (injected into the system prompt), and on session start it **surfaces unfinished board tasks and resumes them** by delegating to each task's designated agent.
+Adds a single `subagent` tool to your pi session that delegates work to
+specialized agents (scout, planner, reviewer, worker) running as isolated
+`pi --mode json` subprocesses. Three modes:
 
-## Tools & commands
+- **Single** — one agent, one task
+- **Parallel** — up to 8 tasks, 4 concurrent; each result capped at 50 KB
+- **Chain** — sequential steps with `{previous}` placeholder; stops at first failure
 
-| Kind | Name | What it does |
-|---|---|---|
-<!-- todo_write and /todos moved to @aprimediet/todo v1.0.0+ -->
-| Tool | `subagent` | delegate to an agent in an isolated context — **single / parallel / chain**; pass `taskId` to run a board task |
-| Tool | `task` | manage the persistent kanban board — `create`/`update`/`list`/`get` cards with a designated agent + structured instruction |
-| Command | `/tasks [all\|<id>]` | show the kanban board (or one card's detail) |
-| Command | `/minion install-agents [--project]` | (optional) export the bundled agents for editing |
-| Prompt | `/implement <x>` | chain: explore → plan → general-purpose |
-| Prompt | `/scout-and-plan <x>` | chain: explore → plan (no implementation) |
-| Prompt | `/implement-and-review <x>` | chain: general-purpose → code-reviewer → general-purpose |
-| Prompt | `/review <x>` | parallel: code-reviewer + silent-failure-hunter + type-design-analyzer |
+Plus a lazy `list` mode so the model can discover the roster on demand.
 
-### `subagent` modes
-- **single** — `{ agent, task }`
-- **parallel** — `{ tasks: [{agent, task}, …] }` (≤8 total, ≤4 concurrent; output capped at 50 KB/task to the model)
-- **chain** — `{ chain: [{agent, task}, …] }` where `task` may contain `{previous}` (the prior step's output)
+## Install
 
-Each subagent runs as a real `pi --mode json -p --no-session` subprocess (isolated context), streams progress live, and Ctrl+C kills it (SIGTERM→SIGKILL).
-
-## Persistent task board & project storage (clean working tree)
-
-minion keeps a durable **kanban board** so delegated work survives across sessions. The only thing written into your working tree is a single identifier file, `<cwd>/.pi/<project-id>.md`; everything else lives globally under `~/.pi/projects/<project-id>/`:
-
-```
-<cwd>/.pi/<project-id>.md     ← the ONLY working-tree artifact (a pointer)
-~/.pi/projects/<project-id>/
-  project.json                metadata (id, name, paths seen, timestamps)
-  tasks/<task-id>.md          kanban cards: status, agent, instruction, acceptance, activity log
-  todos/<session>.md          in-session todo snapshots
-  delegations/<ts>-*.md        full record of every subagent delegation (task sent + result)
+```sh
+pi install npm:@aprimediet/minion
 ```
 
-This is **shared with `@aprimediet/memory`**: both use the same deterministic project id (`<dir-slug>-<8charPathHash>`, recorded in the marker) and the same marker file, so the two extensions cooperate in one `~/.pi/projects/<id>/` workspace with a single cwd pointer.
+Then install the bundled agent definitions:
 
-**Kanban columns (status):** `backlog → todo → in_progress → blocked → review → done → cancelled`. A card carries a **designated agent** (assignee) and a **structured instruction** (+ acceptance criteria) the subagent can execute directly.
+```text
+/minion install-agents
+```
 
-**Delegate a task:** `subagent({ agent, taskId })` loads the card's instruction, marks it `in_progress`, runs, then sets it to `review` (success) or `blocked` (failure) and appends to its activity log — and records the full delegation under `delegations/`.
+(add `--project` to put them in `.pi/agents/` instead of `~/.pi/agent/agents/`).
 
-**Resume on start:** unfinished cards (`todo`/`in_progress`/`blocked`) are injected into the system prompt at session start with an instruction to resume them by delegating to their agent. View anytime with `/tasks`.
+## Usage
 
-## Bundled agents
+```text
+# Discover available agents
+subagent({ list: true })
 
-`general-purpose`, `explore`, `plan`, `code-reviewer`, `code-simplifier`, `silent-failure-hunter`, `type-design-analyzer`, `comment-analyzer`, `pr-test-analyzer`, `debugger`, `test-writer`, `docs-writer`.
+# Single delegation
+subagent({ agent: "scout", task: "find auth flow" })
 
-They are **bundled in the extension** and work immediately — no copy step. User agents in `~/.pi/agent/agents/` and (with `agentScope:"both"`, trust-gated) project agents in `.pi/agents/` override bundled ones by name.
+# Parallel fan-out
+subagent({ tasks: [{ agent: "scout", task: "auth" }, { agent: "scout", task: "billing" }] })
 
-## Per-agent models
+# Chain: scout → planner → worker
+subagent({ chain: [
+  { agent: "scout", task: "explore $@" },
+  { agent: "planner", task: "plan based on: {previous}" },
+  { agent: "worker", task: "implement: {previous}" }
+] })
+```
 
-The default model per agent lives in **`~/.pi/agent/minion.json`** (copied from the bundled default on first run — never overwriting an existing file). Edit it, or add a project `.pi/minion.json` to override:
+Bundled workflow prompts:
+
+- `/implement <query>` — scout → planner → worker
+- `/scout-and-plan <query>` — scout → planner
+- `/implement-and-review <query>` — worker → reviewer → worker
+
+## Per-agent overrides
+
+Override an agent's `model` or `tools` via pi's existing
+`~/.pi/agent/settings.json` under a new top-level `"agents"` key:
 
 ```json
-{ "models": { "*": "claude-sonnet-4-6", "explore": "claude-haiku-4-5", "code-reviewer": "claude-opus-4-8" } }
+{
+  "agents": {
+    "planner": { "model": "opencode/big-pickle", "tools": "read,write,bash" }
+  }
+}
 ```
 
-Resolution: project per-name → global per-name → project `*` → global `*` → agent frontmatter `model:` → `MINION_DEFAULT_MODEL` / `--default-agent-model` → pi default. Re-read each invocation.
+Resolution per field, first hit wins:
 
-## Install / run
+1. `settings.json#agents[name].model` / `.tools`
+2. agent frontmatter `model:` / `tools:`
+3. otherwise omit the flag
 
-**Required companion:** `@aprimediet/todo` (provides `todo_write` + `/todos`):
+The settings file is read fresh per invocation, so edits apply live.
 
-```bash
-pi install npm:@aprimediet/minion
+## Breaking change vs v1
+
+`@aprimediet/minion` v2 is a **deliberate scope reduction**:
+
+- ❌ Removed: persistent kanban `task` board
+- ❌ Removed: `~/.pi/projects/<id>/` workspace, deterministic project IDs, marker files
+- ❌ Removed: session-start task resume
+- ❌ Removed: `todo_write` (now a separate package — `@aprimediet/todo` v1.0.0+)
+- ❌ Removed: v1's six-level model-resolution chain
+
+What stays: the same delegation engine you already know, but split into small
+single-responsibility modules (`schema` / `agents` / `config` / `runner` /
+`modes` / `render` / `index`), each unit-tested in isolation.
+
+If you still want todos, install alongside:
+
+```sh
 pi install npm:@aprimediet/todo
-pi list
-
-# Quick try without installing
-pi -e ./extensions/minion/index.ts -e /path/to/todo/index.ts
 ```
 
-## Layout
+## License
 
-```
-minion/                    # @aprimediet/minion
-├── package.json           # pi manifest: extensions + prompts
-├── index.ts               # factory: wires tools + /minion + /tasks + model seeding + resume
-├── subagent.ts            # subagent tool (subprocess engine) + delegation records + taskId
-├── tasks.ts               # persistent kanban board (task tool) + delegation/resume helpers
-├── project.ts             # project identity + ~/.pi/projects/<id>/ layout (memory-compatible)
-├── agents.ts              # discovery (bundled+user+project) + resolveAgentModel + delegation prompt
-├── minion.json            # default per-agent model map (seeded to ~/.pi/agent/)
-├── agents/                # 12 bundled agent definitions
-└── prompts/               # 4 workflow slash-commands
-```
-
-No third-party runtime deps — only the five pi-core packages (peer, bundled by pi).
+MIT
