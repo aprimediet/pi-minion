@@ -5,9 +5,13 @@ features, success metrics): see [docs/PRD.md](docs/PRD.md).
 
 ## Summary
 
-A pi extension that brings structured delegation to the pi coding agent: `todo_write`,
-`subagent` (isolated subprocess delegation), a persistent kanban `task` board, and
-12 bundled specialized agents with per-agent model configuration.
+A pi extension that brings structured delegation to the pi coding agent: `subagent`
+(isolated subprocess delegation), a persistent kanban `task` board, and 12 bundled
+specialized agents with per-agent model configuration.
+
+**v1.1.0 breaking change:** the `todo_write` tool and `/todos` command have been
+extracted into `@aprimediet/todo`. Install alongside minion:
+`pi install npm:@aprimediet/todo`.
 
 ## Tech Stack
 

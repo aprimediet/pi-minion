@@ -1,6 +1,10 @@
 # @aprimediet/minion
 
-Claude-Code-style **delegation** for the [pi coding agent](https://www.npmjs.com/package/@earendil-works/pi-coding-agent): a TodoWrite-style task tracker, a `subagent` (Task) tool that runs work in isolated `pi` subprocesses, a **persistent kanban task board** for cross-session delegation, and a **bundled library of 12 specialized agents** with per-agent model config.
+Claude-Code-style **delegation** for the [pi coding agent](https://www.npmjs.com/package/@earendil-works/pi-coding-agent): a `subagent` (Task) tool that runs work in isolated `pi` subprocesses, a **persistent kanban task board** for cross-session delegation, and a **bundled library of 12 specialized agents** with per-agent model configuration.
+
+> **v1.1.0 breaking change:** the `todo_write` tool and `/todos` command have been
+> extracted into `@aprimediet/todo`. Install alongside minion:
+> `pi install npm:@aprimediet/todo`.
 
 pi is also made **aware of its delegation capability and the agent roster** every turn (injected into the system prompt), and on session start it **surfaces unfinished board tasks and resumes them** by delegating to each task's designated agent.
 
@@ -8,8 +12,7 @@ pi is also made **aware of its delegation capability and the agent roster** ever
 
 | Kind | Name | What it does |
 |---|---|---|
-| Tool | `todo_write` | maintain an in-session task list (full-list replace; one `in_progress` at a time) |
-| Command | `/todos` | show the current task list |
+<!-- todo_write and /todos moved to @aprimediet/todo v1.0.0+ -->
 | Tool | `subagent` | delegate to an agent in an isolated context — **single / parallel / chain**; pass `taskId` to run a board task |
 | Tool | `task` | manage the persistent kanban board — `create`/`update`/`list`/`get` cards with a designated agent + structured instruction |
 | Command | `/tasks [all\|<id>]` | show the kanban board (or one card's detail) |
@@ -65,12 +68,15 @@ Resolution: project per-name → global per-name → project `*` → global `*` 
 
 ## Install / run
 
+**Required companion:** `@aprimediet/todo` (provides `todo_write` + `/todos`):
+
 ```bash
 pi install npm:@aprimediet/minion
+pi install npm:@aprimediet/todo
 pi list
 
 # Quick try without installing
-pi -e ./extensions/minion/index.ts
+pi -e ./extensions/minion/index.ts -e /path/to/todo/index.ts
 ```
 
 ## Layout
@@ -79,7 +85,6 @@ pi -e ./extensions/minion/index.ts
 minion/                    # @aprimediet/minion
 ├── package.json           # pi manifest: extensions + prompts
 ├── index.ts               # factory: wires tools + /minion + /tasks + model seeding + resume
-├── todo.ts                # todo_write + /todos + todos/ snapshots
 ├── subagent.ts            # subagent tool (subprocess engine) + delegation records + taskId
 ├── tasks.ts               # persistent kanban board (task tool) + delegation/resume helpers
 ├── project.ts             # project identity + ~/.pi/projects/<id>/ layout (memory-compatible)

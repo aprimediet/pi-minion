@@ -2,7 +2,6 @@
  * @aprimediet/minion
  *
  * Claude-Code-style delegation for the pi coding agent:
- *   - todo_write  (TodoWrite) + /todos
  *   - subagent    (Task: single / parallel / chain, isolated pi subprocesses)
  *   - a bundled library of 12 specialized agents, with per-agent model config
  *
@@ -17,7 +16,6 @@ import { buildDelegationSystemPrompt, bundledAgentsDir, bundledModelsFile, setDe
 import { ensureProject, resolveProject } from "./project.ts";
 import { registerSubagentTool } from "./subagent.ts";
 import { buildResumePrompt, getTask, listTasks, registerTaskTool, renderBoard } from "./tasks.ts";
-import { registerTodoTool } from "./todo.ts";
 
 function copyAgentFiles(srcDir: string, destDir: string): { copied: number; skipped: number } {
 	fs.mkdirSync(destDir, { recursive: true });
@@ -37,7 +35,6 @@ function copyAgentFiles(srcDir: string, destDir: string): { copied: number; skip
 }
 
 export default function minionExtension(pi: ExtensionAPI): void {
-	registerTodoTool(pi);
 	registerSubagentTool(pi);
 	registerTaskTool(pi);
 
