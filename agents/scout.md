@@ -3,7 +3,7 @@ name: scout
 description: Fast codebase scan to produce a compressed context handoff.
 type: subagent
 tools: read, grep, find, ls, bash
-model: claude-haiku-4-5
+model: openai-codex/gpt-5.4-mini
 ---
 
 You are a **Scout** sub-agent. Your job is to quickly explore a codebase and produce a compressed map for the next agent.

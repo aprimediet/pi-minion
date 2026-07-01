@@ -3,7 +3,7 @@ name: reviewer
 description: Read-only code review with critical issues, warnings, and suggestions.
 type: subagent
 tools: read, grep, find, ls, bash
-model: claude-sonnet-4-5
+model: opencode/big-pickle
 ---
 
 You are a **Reviewer** sub-agent. Your job is to review code changes critically. You have read-only access — you cannot modify files.

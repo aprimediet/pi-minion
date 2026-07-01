@@ -3,11 +3,30 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { discoverAgents, formatAgentList, type AgentScope } from "./agents.ts";
+import type { SingleResult } from "./runner.ts";
 
 const AgentScopeSchema = StringEnum(["bundled", "user", "project", "all"] as const, {
     description: "Which agent directories to scan. Default: all.",
     default: "all",
 });
+
+/**
+ * Convert a streaming update from runSingleAgent (raw SingleResult) into the tool-result
+ * shape that pi's ToolExecutionComponent expects (`{ content, details, isError }`).
+ *
+ * pi's renderer calls getTextOutput() on the payload which derefs `result.content.filter(...)`.
+ * The raw SingleResult has no `.content` field, so we must wrap it.
+ *
+ * Exported for unit testing — the contract is the bug fix and must be regression-tested.
+ */
+export function toToolResultUpdate(update: SingleResult): { content: Array<{ type: "text"; text: string }>; details: SingleResult; isError: boolean } {
+    const text = update.outputText || update.stderr || `(${update.agentName} ${update.exitCode === 0 ? "running" : "error"})`;
+    return {
+        content: [{ type: "text", text }],
+        details: update,
+        isError: update.exitCode !== 0,
+    };
+}
 
 const TaskItem = Type.Object({
     agent: Type.String({ description: "Name of the agent to invoke" }),
@@ -95,13 +114,24 @@ export default function minionExtension(pi: ExtensionAPI): void {
                     ? { tasks: params.tasks! }
                     : { agent: params.agent!, task: params.task!, cwd: params.cwd };
 
+            // Wrap pi's onUpdate so streaming updates from runSingleAgent arrive in tool-result
+            // shape (`{ content: [{type, text}], details, isError }`). pi's ToolExecutionComponent
+            // calls getTextOutput() on the payload which derefs `.content.filter(...)` — sending
+            // the raw SingleResult (no `.content`) triggers
+            // "Cannot read properties of undefined (reading 'filter')" on every streaming tick.
+            const wrappedOnUpdate = (update: any) => {
+                if (typeof onUpdate === "function") {
+                    onUpdate(toToolResultUpdate(update));
+                }
+            };
+
             const modeResult = await runMode(
                 mode,
                 agents,
                 modeParams as any,
                 ctx.cwd,
                 _signal ?? new AbortController().signal,
-                onUpdate ?? (() => {}),
+                wrappedOnUpdate,
                 (defaultCwd, agts, agentName, task, cwd, step, sig, upd) =>
                     runSingleAgent(defaultCwd, agts, agentName, task, cwd, step, sig, upd),
             );
@@ -175,7 +205,7 @@ export default function minionExtension(pi: ExtensionAPI): void {
             return new Text(theme.fg("toolTitle", "minion_list"), 0, 0);
         },
         renderResult: (result, _options, _theme, _context) => {
-            const text = result.content[0];
+            const text = result.content?.[0];
             return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
         },
     });
