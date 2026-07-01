@@ -185,5 +185,13 @@ describe("minion extension", () => {
             // Will try to run the agent but since there's no real pi, it will fail
             expect(result.isError).toBe(true);
         });
+
+        it("renders missing tool result content without throwing", async () => {
+            const mod = await import("./index.ts");
+            mod.default(pi);
+
+            const tool = getTool("delegation")!;
+            expect(() => tool.renderResult({ details: undefined }, { expanded: false }, { fg: (_c: string, s: string) => s } as any, {} as any)).not.toThrow();
+        });
     });
 });

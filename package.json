@@ -1,6 +1,6 @@
 {
   "name": "@aprimediet/minion",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "type": "module",
   "description": "Subagent delegation extension for the pi coding agent — discover, list, and delegate tasks to specialized sub-agents.",
   "keywords": ["pi-package"],

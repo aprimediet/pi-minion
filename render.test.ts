@@ -60,6 +60,11 @@ describe("renderResult", () => {
         expect(node).toBeTruthy();
     });
 
+    it("handles missing content gracefully", () => {
+        const result = { details: undefined };
+        expect(() => renderResult(result, { expanded: false }, fakeTheme(), {} as any)).not.toThrow();
+    });
+
     it("renders expanded single mode without throwing", () => {
         const result = {
             content: [{ type: "text", text: "expanded" }],

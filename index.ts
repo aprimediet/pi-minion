@@ -127,7 +127,7 @@ export default function minionExtension(pi: ExtensionAPI): void {
             return new Text(text, 0, 0);
         },
         renderResult: (result, _options, theme, _context) => {
-            const text = result.content[0];
+            const text = result.content?.[0];
             return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
         },
     });
