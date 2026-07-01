@@ -190,9 +190,7 @@ fake runner** returning canned `SingleResult`s (sync/throwing/delayed).
 `{list:true}` first**, `promptGuidelines`, `parameters: SubagentParams`,
 `renderCall`/`renderResult` from `render.ts`). `execute` = discover → `decideMode` → confirm
 gate → resolve each agent's runtime via `config.resolveAgentRuntime` → call `modes` with the
-real runner (`runner.runSingleAgent`). Register `/minion install-agents [--project]` (copies
-bundled `agents/*.md` into `~/.pi/agent/agents` or `.pi/agents`, idempotent, skips existing)
-and `/minion list`. **No `before_agent_start` hook.**
+real runner (`runner.runSingleAgent`). Register `/minion list`. Bundled agents auto-load from the extension's `agents/` folder — no install step needed. User and project overrides follow the precedence chain (bundled → user → settings.json). **No `before_agent_start` hook.**
 
 ## WP8 — bundled `agents/*.md` and `prompts/*.md`
 
@@ -209,7 +207,7 @@ with `{previous}` and `$@` for user input.
 
 - Ensure `package.json` `files` excludes tests and includes `agents/**`,`prompts/**`. **No `minion.json`.**
 - `npm run pack:dry` → confirm only intended files ship.
-- Write `README.md`: install, the three modes + `list`, the `settings.json` `"agents"` override format, `/minion install-agents`, and the v2 breaking-change note (task board / project workspace / resume / todo removed; todos → `@aprimediet/todo`).
+- Write `README.md`: install, the three modes + `list`, bundled-agent auto-loading (override via user/project files or settings.json), and the v2 breaking-change note (task board / project workspace / resume / todo removed; todos → `@aprimediet/todo`).
 
 ---
 

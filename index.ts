@@ -95,40 +95,6 @@ const HERE =
 const BUNDLED_AGENTS_DIR = path.join(HERE, "agents");
 const BUNDLED_PRIMARIES_DIR = path.join(HERE, "primaries");
 
-/** Copy bundled `agents/*.md` into `<dest>` unless already present. Returns names copied. */
-export function installBundledAgents(dest: string): { copied: string[]; skipped: string[]; errors: string[] } {
-	const copied: string[] = [];
-	const skipped: string[] = [];
-	const errors: string[] = [];
-	if (!fs.existsSync(BUNDLED_AGENTS_DIR)) {
-		errors.push(`bundled agents dir missing: ${BUNDLED_AGENTS_DIR}`);
-		return { copied, skipped, errors };
-	}
-	fs.mkdirSync(dest, { recursive: true });
-	let entries: string[];
-	try {
-		entries = fs.readdirSync(BUNDLED_AGENTS_DIR);
-	} catch (e) {
-		errors.push(`cannot read bundled agents: ${(e as Error).message}`);
-		return { copied, skipped, errors };
-	}
-	for (const name of entries) {
-		if (!name.endsWith(".md")) continue;
-		const target = path.join(dest, name);
-		if (fs.existsSync(target)) {
-			skipped.push(name);
-			continue;
-		}
-		try {
-			fs.copyFileSync(path.join(BUNDLED_AGENTS_DIR, name), target);
-			copied.push(name);
-		} catch (e) {
-			errors.push(`${name}: ${(e as Error).message}`);
-		}
-	}
-	return { copied, skipped, errors };
-}
-
 /**
  * Wire up the subagent tool + /minion command + the primary-agent controller.
  *
@@ -440,7 +406,7 @@ export function buildExtension(pi: ExtensionAPI, deps: BuildExtensionDeps): void
 	// ===========================================================================
 
 	pi.registerCommand("minion", {
-		description: "minion utilities (list / install-agents / primaries / plan / build / <name>)",
+		description: "minion utilities (list / primaries / plan / build / <name>)",
 		async handler(args, ctx) {
 			const trimmed = (args ?? "").trim();
 			if (trimmed === "list") {
@@ -454,20 +420,6 @@ export function buildExtension(pi: ExtensionAPI, deps: BuildExtensionDeps): void
 				ctx.ui.notify(`${list.text}${tail}`);
 				return;
 			}
-			if (trimmed.startsWith("install-agents")) {
-				const project = trimmed.includes("--project");
-				const dest = project
-					? path.join(ctx.cwd, CONFIG_DIR_NAME, "agents")
-					: path.join(getAgentDir(), "agents");
-				const result = installBundledAgents(dest);
-				const summary = [
-					`copied ${result.copied.length}`,
-					`skipped ${result.skipped.length}`,
-					...(result.errors.length > 0 ? [`errors: ${result.errors.join("; ")}`] : []),
-				].join(", ");
-				ctx.ui.notify(`Installed bundled agents into ${dest}: ${summary}`);
-				return;
-			}
 			if (trimmed === "primaries") {
 				const names = controller.list().map((p) => `${p.name} (${p.source}): ${p.description}`).join("; ");
 				ctx.ui.notify(names || "none");
@@ -478,7 +430,7 @@ export function buildExtension(pi: ExtensionAPI, deps: BuildExtensionDeps): void
 				return;
 			}
 			ctx.ui.notify(
-				"Usage: /minion list | /minion install-agents [--project] | /minion primaries | /minion plan | /minion build | /minion <name>",
+				"Usage: /minion list | /minion primaries | /minion plan | /minion build | /minion <name>",
 			);
 		},
 	});
@@ -507,7 +459,8 @@ function readRestoredPrimary(ctx: ExtensionContext): string | undefined {
 /** Real wiring — used as the default export and for production. */
 export function defaultExtension(pi: ExtensionAPI): void {
 	buildExtension(pi, {
-		discoverAgents: realDiscoverAgents,
+		discoverAgents: (cwd, scope) =>
+			realDiscoverAgents(cwd, scope, { bundledAgentsDir: BUNDLED_AGENTS_DIR }),
 		runAgentFn: (req) =>
 			realRunSingleAgent({
 				agents: req.agents,

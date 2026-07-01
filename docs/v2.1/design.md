@@ -193,8 +193,7 @@ to `BuildExtensionDeps`, defaulted in `defaultExtension`). Register:
   restored in `session_start` via `ctx.sessionManager.getEntries()` (survives resume).
 
 The existing `subagent` tool keeps working; it delegates only to `type: subagent` (or
-untyped) agents. `/minion list` / `install-agents` unchanged (install still copies the
-bundled `agents/` subagents; bundled primaries are never copied).
+untyped) agents. `/minion list` unchanged. Bundled agents auto-load from the extension's `agents/` folder — no install step needed.
 
 ## 7. Changes to existing modules
 

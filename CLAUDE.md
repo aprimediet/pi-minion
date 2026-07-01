@@ -64,7 +64,7 @@ This pi extension — **no build, lint, or test step**, no `tsconfig.json`
 
 - **Try locally, no install:** `pi -e ./index.ts`
 - **Install from npm:** `pi install npm:@aprimediet/minion`
-- **In-session commands (planned):** `/minion install-agents [--project]` copy bundled agents into `~/.pi/agent/agents` (or `.pi/agents`); workflow prompts `/implement`, `/scout-and-plan`, `/implement-and-review`.
+- **In-session commands:** workflow prompts `/implement`, `/scout-and-plan`, `/implement-and-review`. Bundled agents auto-load from the extension's `agents/` folder — no install step needed.
 - **Packaging dry-run (from v1 scripts):** `npm run pack:dry`
 
 **No test infrastructure** — coverage zero, no test framework configured.

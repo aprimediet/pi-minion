@@ -10,8 +10,9 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const AGENTS_DIR = path.join(HERE, "agents");
 const PRIMARIES_DIR = path.join(HERE, "primaries");
 const PROMPTS_DIR = path.join(HERE, "prompts");
+const TEMPLATES_DIR = path.join(HERE, "templates");
 
-const EXPECTED_AGENTS = ["scout", "planner", "reviewer", "worker"] as const;
+const EXPECTED_AGENTS = ["scout", "planner", "reviewer", "worker", "docs-writer"] as const;
 
 describe("bundled agents/*.md manifest", () => {
 	const bundled = loadAgentsFromDir(AGENTS_DIR, "user");
@@ -20,7 +21,7 @@ describe("bundled agents/*.md manifest", () => {
 		expect(bundled.length).toBeGreaterThan(0);
 	});
 
-	it("agent set is exactly { scout, planner, reviewer, worker }", () => {
+	it("agent set is exactly { scout, planner, reviewer, worker, docs-writer }", () => {
 		const names = bundled.map((a) => a.name).sort();
 		expect(names).toEqual([...EXPECTED_AGENTS].sort());
 	});
@@ -109,5 +110,124 @@ describe("bundled prompts/*.md manifest", () => {
 			const raw = fs.readFileSync(path.join(PROMPTS_DIR, file), "utf-8");
 			expect(raw).toMatch(/\{previous\}|chain/);
 		}
+	});
+});
+
+// =============================================================================
+// v2.2.0 — Interactive /init prompt + bundled templates
+// =============================================================================
+
+describe("bundled init prompt (interactive workflow)", () => {
+	const initPath = path.join(PROMPTS_DIR, "init.md");
+
+	it("prompts/init.md exists with a frontmatter description", () => {
+		expect(fs.existsSync(initPath)).toBe(true);
+		const raw = fs.readFileSync(initPath, "utf-8");
+		const { frontmatter } = parseFrontmatter<Record<string, string>>(raw);
+		expect(typeof frontmatter.description).toBe("string");
+		expect(frontmatter.description.length).toBeGreaterThan(5);
+	});
+
+	it("uses one-question-per-turn interactive pattern", () => {
+		const raw = fs.readFileSync(initPath, "utf-8");
+		expect(raw).toMatch(/one question per turn|one at a time/i);
+	});
+
+	it("prefers multiple choice / MCQ format", () => {
+		const raw = fs.readFileSync(initPath, "utf-8");
+		expect(raw).toMatch(/multiple choice|MCQ/i);
+	});
+
+	it("declares a HARD-GATE before file writes", () => {
+		const raw = fs.readFileSync(initPath, "utf-8");
+		expect(raw).toMatch(/HARD-GATE/);
+	});
+
+	it("declares 4 approval gates", () => {
+		const raw = fs.readFileSync(initPath, "utf-8");
+		expect(raw).toMatch(/Gate 1/);
+		expect(raw).toMatch(/Gate 2/);
+		expect(raw).toMatch(/Gate 3/);
+		expect(raw).toMatch(/Gate 4/);
+	});
+
+	it("checks the active primary / build mode before writing", () => {
+		const raw = fs.readFileSync(initPath, "utf-8");
+		expect(raw).toMatch(/primary|build mode|write access/i);
+	});
+
+	it("references both template files (AGENT + PRD)", () => {
+		const raw = fs.readFileSync(initPath, "utf-8");
+		expect(raw).toMatch(/AGENT\.template\.md/);
+		expect(raw).toMatch(/PRD\.template\.md/);
+	});
+
+	it("covers the 8 interview topics (project type, stack, vision, users, goals, arch, out-of-scope, roadmap)", () => {
+		const raw = fs.readFileSync(initPath, "utf-8");
+		expect(raw).toMatch(/Q1/);
+		expect(raw).toMatch(/Q2/);
+		expect(raw).toMatch(/Q3/);
+		expect(raw).toMatch(/Q4/);
+		expect(raw).toMatch(/Q5/);
+		expect(raw).toMatch(/Q6/);
+		expect(raw).toMatch(/Q7/);
+		expect(raw).toMatch(/Q8/);
+	});
+
+	it("delegates file writing to docs-writer subagent", () => {
+		const raw = fs.readFileSync(initPath, "utf-8");
+		expect(raw).toMatch(/docs-writer/);
+		expect(raw).toMatch(/subagent\s*\(\s*\{[^}]*agent:\s*["']docs-writer["']/s);
+	});
+
+	it("explains how to create docs-writer at .pi/agents/ if missing", () => {
+		const raw = fs.readFileSync(initPath, "utf-8");
+		expect(raw).toMatch(/\.pi\/agents\/docs-writer\.md/);
+	});
+
+	it("includes the docs-writer agent definition for runtime creation", () => {
+		const raw = fs.readFileSync(initPath, "utf-8");
+		expect(raw).toMatch(/name:\s*docs-writer/);
+		expect(raw).toMatch(/type:\s*subagent/);
+	});
+});
+
+describe("bundled templates/init/*.md manifest", () => {
+	const agentTpl = path.join(TEMPLATES_DIR, "init", "AGENT.template.md");
+	const prdTpl = path.join(TEMPLATES_DIR, "init", "PRD.template.md");
+
+	it("templates/init/ directory exists", () => {
+		expect(fs.existsSync(path.join(TEMPLATES_DIR, "init"))).toBe(true);
+	});
+
+	it("AGENT.template.md exists", () => {
+		expect(fs.existsSync(agentTpl)).toBe(true);
+	});
+
+	it("PRD.template.md exists", () => {
+		expect(fs.existsSync(prdTpl)).toBe(true);
+	});
+
+	it("AGENT.template.md contains {{placeholder}} substitution patterns", () => {
+		const raw = fs.readFileSync(agentTpl, "utf-8");
+		// Expect at least 3 distinct placeholders
+		const placeholders = raw.match(/\{\{[a-z_0-9]+\}\}/gi) ?? [];
+		expect(placeholders.length).toBeGreaterThanOrEqual(3);
+	});
+
+	it("PRD.template.md contains {{placeholder}} substitution patterns", () => {
+		const raw = fs.readFileSync(prdTpl, "utf-8");
+		const placeholders = raw.match(/\{\{[a-z_0-9]+\}\}/gi) ?? [];
+		expect(placeholders.length).toBeGreaterThanOrEqual(3);
+	});
+
+	it("AGENT.template.md documents the {{placeholder}} -> question map (template reference section)", () => {
+		const raw = fs.readFileSync(agentTpl, "utf-8");
+		expect(raw).toMatch(/Template Reference/i);
+	});
+
+	it("PRD.template.md documents the {{placeholder}} -> question map (template reference section)", () => {
+		const raw = fs.readFileSync(prdTpl, "utf-8");
+		expect(raw).toMatch(/Template Reference/i);
 	});
 });

@@ -79,7 +79,7 @@ export interface UsageStats {
 /** Single agent run result — what `runner.runSingleAgent` returns. */
 export interface SingleResult {
 	agent: string;
-	agentSource: "user" | "project" | "unknown";
+	agentSource: "user" | "project" | "bundled" | "unknown";
 	task: string;
 	exitCode: number;
 	messages: Message[];

@@ -329,6 +329,223 @@ describe("discoverAgents", () => {
 	});
 });
 
+// =============================================================================
+// Bundled agent discovery
+// =============================================================================
+//
+// Bundled agents (extension's `agents/` dir) are the base layer. User agents
+// override bundled by name, project agents override user by name. Scope controls
+// which override layers are included; bundled is always included when its dir
+// is passed via options.
+
+describe("loadAgentsFromDir — 'bundled' source", () => {
+	it("accepts 'bundled' as a source value", () => {
+		const dir = path.join(tmp, "bundled");
+		fs.mkdirSync(dir);
+		fs.writeFileSync(
+			path.join(dir, "scout.md"),
+			`---\nname: scout\ndescription: d\n---\nbody`,
+		);
+		const agents = loadAgentsFromDir(dir, "bundled");
+		expect(agents).toHaveLength(1);
+		expect(agents[0].source).toBe("bundled");
+	});
+});
+
+describe("discoverAgents — bundled (extension's agents/ dir)", () => {
+	let userDir: string;
+	let bundledDir: string;
+	let projectDir: string;
+	let projectRoot: string;
+	beforeEach(() => {
+		bundledDir = path.join(tmp, "bundled-agents");
+		userDir = path.join(tmp, "user-agents");
+		projectRoot = path.join(tmp, "proj");
+		projectDir = path.join(projectRoot, ".pi", "agents");
+		fs.mkdirSync(bundledDir, { recursive: true });
+		fs.mkdirSync(userDir, { recursive: true });
+		fs.mkdirSync(projectDir, { recursive: true });
+	});
+
+	it("loads bundled agents as base when bundledAgentsDir is provided", () => {
+		fs.writeFileSync(
+			path.join(bundledDir, "scout.md"),
+			`---\nname: scout\ndescription: bundled scout\n---\nbundled body`,
+		);
+		const out = discoverAgents(tmp, "user", {
+			bundledAgentsDir: bundledDir,
+			userAgentsDir: userDir,
+		});
+		expect(out.agents.map((a) => a.name)).toEqual(["scout"]);
+		expect(out.agents[0].source).toBe("bundled");
+		expect(out.agents[0].description).toBe("bundled scout");
+	});
+
+	it("user agent overrides bundled by name (same name → user wins)", () => {
+		fs.writeFileSync(
+			path.join(bundledDir, "scout.md"),
+			`---\nname: scout\ndescription: bundled scout\n---\nbundled body`,
+		);
+		fs.writeFileSync(
+			path.join(userDir, "scout.md"),
+			`---\nname: scout\ndescription: user scout\n---\nuser body`,
+		);
+		const out = discoverAgents(tmp, "user", {
+			bundledAgentsDir: bundledDir,
+			userAgentsDir: userDir,
+		});
+		expect(out.agents).toHaveLength(1);
+		expect(out.agents[0].source).toBe("user");
+		expect(out.agents[0].description).toBe("user scout");
+		expect(out.agents[0].systemPrompt.trim()).toBe("user body");
+	});
+
+	it("project agent overrides bundled by name (scope=project)", () => {
+		fs.writeFileSync(
+			path.join(bundledDir, "scout.md"),
+			`---\nname: scout\ndescription: bundled scout\n---\nbundled body`,
+		);
+		fs.writeFileSync(
+			path.join(projectDir, "scout.md"),
+			`---\nname: scout\ndescription: project scout\n---\nproject body`,
+		);
+		const out = discoverAgents(projectRoot, "project", {
+			bundledAgentsDir: bundledDir,
+			userAgentsDir: userDir,
+		});
+		expect(out.agents).toHaveLength(1);
+		expect(out.agents[0].source).toBe("project");
+		expect(out.agents[0].description).toBe("project scout");
+	});
+
+	it("scope=both: project > user > bundled precedence", () => {
+		fs.writeFileSync(
+			path.join(bundledDir, "scout.md"),
+			`---\nname: scout\ndescription: bundled scout\n---\nbundled body`,
+		);
+		fs.writeFileSync(
+			path.join(userDir, "scout.md"),
+			`---\nname: scout\ndescription: user scout\n---\nuser body`,
+		);
+		fs.writeFileSync(
+			path.join(projectDir, "scout.md"),
+			`---\nname: scout\ndescription: project scout\n---\nproject body`,
+		);
+		// reviewer only in user; worker only in bundled; planner only in project.
+		fs.writeFileSync(
+			path.join(userDir, "reviewer.md"),
+			`---\nname: reviewer\ndescription: r\n---\nbody`,
+		);
+		fs.writeFileSync(
+			path.join(bundledDir, "worker.md"),
+			`---\nname: worker\ndescription: w\n---\nbody`,
+		);
+		fs.writeFileSync(
+			path.join(projectDir, "planner.md"),
+			`---\nname: planner\ndescription: p\n---\nbody`,
+		);
+		const out = discoverAgents(projectRoot, "both", {
+			bundledAgentsDir: bundledDir,
+			userAgentsDir: userDir,
+		});
+		const names = out.agents.map((a) => a.name).sort();
+		expect(names).toEqual(["planner", "reviewer", "scout", "worker"]);
+
+		// Precedence: project > user > bundled
+		const scout = out.agents.find((a) => a.name === "scout");
+		expect(scout?.source).toBe("project");
+		expect(scout?.description).toBe("project scout");
+
+		// reviewer only in user
+		const reviewer = out.agents.find((a) => a.name === "reviewer");
+		expect(reviewer?.source).toBe("user");
+
+		// worker only in bundled
+		const worker = out.agents.find((a) => a.name === "worker");
+		expect(worker?.source).toBe("bundled");
+
+		// planner only in project
+		const planner = out.agents.find((a) => a.name === "planner");
+		expect(planner?.source).toBe("project");
+	});
+
+	it("scope=user: bundled + user (no project), user overrides bundled", () => {
+		fs.writeFileSync(
+			path.join(bundledDir, "scout.md"),
+			`---\nname: scout\ndescription: bundled scout\n---\nbody`,
+		);
+		fs.writeFileSync(
+			path.join(projectDir, "scout.md"),
+			`---\nname: scout\ndescription: project scout\n---\nbody`,
+		);
+		const out = discoverAgents(projectRoot, "user", {
+			bundledAgentsDir: bundledDir,
+			userAgentsDir: userDir,
+		});
+		// scope=user → project agents hidden, but bundled still visible.
+		// project scout is hidden, bundled scout is the base (no user override).
+		expect(out.agents).toHaveLength(1);
+		expect(out.agents[0].source).toBe("bundled");
+		expect(out.agents[0].description).toBe("bundled scout");
+	});
+
+	it("scope=project: bundled + project (no user), project overrides bundled", () => {
+		fs.writeFileSync(
+			path.join(bundledDir, "scout.md"),
+			`---\nname: scout\ndescription: bundled scout\n---\nbody`,
+		);
+		fs.writeFileSync(
+			path.join(userDir, "scout.md"),
+			`---\nname: scout\ndescription: user scout\n---\nbody`,
+		);
+		fs.writeFileSync(
+			path.join(projectDir, "scout.md"),
+			`---\nname: scout\ndescription: project scout\n---\nbody`,
+		);
+		const out = discoverAgents(projectRoot, "project", {
+			bundledAgentsDir: bundledDir,
+			userAgentsDir: userDir,
+		});
+		// scope=project → user agents hidden, project wins over bundled.
+		expect(out.agents).toHaveLength(1);
+		expect(out.agents[0].source).toBe("project");
+		expect(out.agents[0].description).toBe("project scout");
+	});
+
+	it("scope=project with no project dir: bundled agents still available", () => {
+		const emptyProjRoot = path.join(tmp, "empty-proj");
+		fs.mkdirSync(emptyProjRoot);
+		fs.writeFileSync(
+			path.join(bundledDir, "scout.md"),
+			`---\nname: scout\ndescription: bundled\n---\nbody`,
+		);
+		const out = discoverAgents(emptyProjRoot, "project", {
+			bundledAgentsDir: bundledDir,
+			userAgentsDir: userDir,
+		});
+		expect(out.agents.map((a) => a.name)).toEqual(["scout"]);
+		expect(out.agents[0].source).toBe("bundled");
+	});
+
+	it("bundledAgentsDir undefined → no bundled agents loaded (backward compat)", () => {
+		fs.writeFileSync(
+			path.join(bundledDir, "scout.md"),
+			`---\nname: scout\ndescription: d\n---\nbody`,
+		);
+		// bundledDir exists but is not passed via options → should not be read.
+		const out = discoverAgents(tmp, "user", { userAgentsDir: userDir });
+		expect(out.agents).toEqual([]);
+	});
+
+	it("bundledAgentsDir pointing at missing dir → no bundled agents (no throw)", () => {
+		const out = discoverAgents(tmp, "user", {
+			bundledAgentsDir: path.join(tmp, "does-not-exist"),
+			userAgentsDir: userDir,
+		});
+		expect(out.agents).toEqual([]);
+	});
+});
+
 describe("formatAgentList", () => {
 	const baseAgents = [
 		{ name: "a", source: "user" as const, description: "alpha" },

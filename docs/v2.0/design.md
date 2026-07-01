@@ -195,11 +195,12 @@ Ship exactly four agents as `agents/*.md` (frontmatter: `name`, `description`, `
 
 (More can be added later as separate `.md` files at zero code cost.)
 
-**Installation:** instead of v1's auto-seed on `session_start`, provide an explicit
-`/minion install-agents [--project]` command that copies bundled `agents/*.md` into
-`~/.pi/agent/agents` only when asked. Explicit, no hidden writes,
-idempotent (skips existing files). The README also documents the symlink approach the
-example uses.
+**Installation:** bundled agents (`scout`, `planner`, `reviewer`, `worker`) auto-load from the extension's `agents/` folder — no setup command needed. They live alongside this code and are available on every invocation.
+
+Override a bundled agent by name:
+- Drop a same-name file into `~/.pi/agent/agents/` (user override)
+- Drop a same-name file into `<cwd>/.pi/agents/` (project override, confirmed at first use)
+- Override `model` or `tools` via `settings.json#agents.<name>`
 
 ## 8. Workflow prompts
 

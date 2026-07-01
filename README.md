@@ -21,13 +21,12 @@ Plus a lazy `list` mode so the model can discover the roster on demand.
 pi install npm:@aprimediet/minion
 ```
 
-Then install the bundled agent definitions:
+Bundled agents (`scout`, `planner`, `reviewer`, `worker`) are **automatically available** after install — no setup command needed. They live in the extension's `agents/` folder and load on every invocation.
 
-```text
-/minion install-agents
-```
-
-(add `--project` to put them in `.pi/agents/` instead of `~/.pi/agent/agents/`).
+Override a bundled agent by name:
+- Drop a same-name file into `~/.pi/agent/agents/` (user override)
+- Drop a same-name file into `<cwd>/.pi/agents/` (project override, confirmed at first use)
+- Override `model` or `tools` via `settings.json#agents.<name>`
 
 ## Usage
 
@@ -51,6 +50,7 @@ subagent({ chain: [
 
 Bundled workflow prompts:
 
+- `/init` — bootstrap a new project with `AGENTS.md` (conventions) and `PRD.md` (product requirements) via an interactive 8-question interview with 4 approval gates (modeled on the brainstorming skill pattern)
 - `/implement <query>` — scout → planner → worker
 - `/scout-and-plan <query>` — scout → planner
 - `/implement-and-review <query>` — worker → reviewer → worker
