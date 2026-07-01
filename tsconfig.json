@@ -19,6 +19,6 @@
     "isolatedModules": true,
     "verbatimModuleSyntax": true
   },
-  "include": ["*.ts", "agents/**", "prompts/**"],
+  "include": ["*.ts"],
   "exclude": ["node_modules"]
 }

@@ -1,375 +1,393 @@
-/**
- * Run a single subagent subprocess: spawn `pi --mode json`, parse NDJSON events,
- * accumulate usage, support abort + SIGTERM→SIGKILL, clean up temp prompt file.
- *
- * Pure logic (`buildPiArgs`, `accumulateEvent`, `parseNdjson`) is split out for
- * unit testing. The actual subprocess shell is thin and gets a single integration
- * test against a stub script.
- */
-
-import { spawn } from "node:child_process";
-import type { ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
-import type { Message } from "@earendil-works/pi-ai";
-import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
-import type { AgentConfig } from "./agents.ts";
-import type { SingleResult, SubagentDetails, UsageStats } from "./schema.ts";
-import { emptyUsage } from "./schema.ts";
+import { spawn as defaultSpawn } from "node:child_process";
 
-// ---------------------------------------------------------------------------
-// Pure: arg builder
-// ---------------------------------------------------------------------------
+export const MAX_PARALLEL_TASKS = 8;
+export const MAX_CONCURRENCY = 4;
+export const PER_TASK_OUTPUT_CAP = 50 * 1024;
+export const COLLAPSED_ITEM_COUNT = 10;
 
-export interface BuildPiArgsInput {
-	model?: string;
-	tools?: string[];
-	promptPath?: string;
-	task: string;
+export interface BuildArgsOptions {
+    model?: string;
+    tools?: string[];
+    promptFilePath?: string;
 }
 
-/**
- * Build the argv passed to the `pi` subprocess.
- *   `["--mode","json","-p","--no-session"]`
- *   + `--model <m>` iff model
- *   + `--tools a,b` iff tools non-empty
- *   + `--append-system-prompt <path>` iff promptPath
- *   + `Task: <task>` (positional, always last)
- */
-export function buildPiArgs(input: BuildPiArgsInput): string[] {
-	const args: string[] = ["--mode", "json", "-p", "--no-session"];
-	if (input.model) args.push("--model", input.model);
-	if (input.tools && input.tools.length > 0) args.push("--tools", input.tools.join(","));
-	if (input.promptPath) args.push("--append-system-prompt", input.promptPath);
-	args.push(`Task: ${input.task}`);
-	return args;
+export interface UsageStats {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+    cost: number;
+    contextTokens: number;
 }
 
-// ---------------------------------------------------------------------------
-// Pure: NDJSON parser
-// ---------------------------------------------------------------------------
-
-export interface ParseNdjsonResult {
-	events: unknown[];
-	/** Trailing partial line to prepend to the next chunk. */
-	carry: string;
+export interface SingleResult {
+    agentName: string;
+    agentSource: string;
+    messages: any[];
+    turns: number;
+    model: string;
+    stopReason: string;
+    exitCode: number;
+    errorMessage?: string;
+    stderr: string;
+    outputText: string;
+    projectAgentsDir?: string | null;
+    usage: UsageStats;
 }
 
-/**
- * Split a chunk on `\n`, parse each line as JSON. Lines that fail to parse are
- * silently dropped. The trailing partial line (after the last `\n`) is preserved
- * in `carry` and should be prepended to the next chunk.
- */
-export function parseNdjson(chunk: string, carry: string): ParseNdjsonResult {
-	const combined = carry + chunk;
-	const lines = combined.split("\n");
-	const nextCarry = lines.pop() ?? "";
-	const events: unknown[] = [];
-	for (const line of lines) {
-		const trimmed = line.trim();
-		if (!trimmed) continue;
-		try {
-			events.push(JSON.parse(trimmed));
-		} catch {
-			/* drop garbage lines */
-		}
-	}
-	return { events, carry: nextCarry };
+export function makeEmptyResult(agentName: string, agentSource: string): SingleResult {
+    return {
+        agentName,
+        agentSource,
+        messages: [],
+        turns: 0,
+        model: "",
+        stopReason: "",
+        exitCode: 0,
+        stderr: "",
+        outputText: "",
+        usage: {
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheWriteTokens: 0,
+            cost: 0,
+            contextTokens: 0,
+        },
+    };
 }
 
-// ---------------------------------------------------------------------------
-// Pure: event reducer
-// ---------------------------------------------------------------------------
+export async function mapWithConcurrencyLimit<T, R>(
+    items: T[],
+    limit: number,
+    fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+    const results: R[] = new Array(items.length);
+    let cursor = 0;
 
-export interface RunnerAccumulatorState {
-	messages: Message[];
-	usage: UsageStats;
-	model?: string;
-	stopReason?: string;
-	errorMessage?: string;
+    async function worker(): Promise<void> {
+        while (cursor < items.length) {
+            const idx = cursor++;
+            results[idx] = await fn(items[idx]!, idx);
+        }
+    }
+
+    const workers = Array.from({ length: Math.min(limit, items.length) }, () => worker());
+    await Promise.all(workers);
+    return results;
 }
 
-function freshState(): RunnerAccumulatorState {
-	return { messages: [], usage: emptyUsage() };
+export function reduceEvent(result: SingleResult, line: string): void {
+    if (!line.trim()) return;
+    let parsed: any;
+    try {
+        parsed = JSON.parse(line);
+    } catch {
+        return;
+    }
+
+    switch (parsed.event) {
+        case "message_end": {
+            const msg = parsed.message;
+            if (msg) result.messages.push(msg);
+            result.turns++;
+            if (parsed.usage) {
+                result.usage.inputTokens += parsed.usage.input ?? 0;
+                result.usage.outputTokens += parsed.usage.output ?? 0;
+                result.usage.cacheReadTokens += parsed.usage.cache_read ?? 0;
+                result.usage.cacheWriteTokens += parsed.usage.cache_write ?? 0;
+                result.usage.cost += parsed.usage.cost ?? 0;
+                result.usage.contextTokens += parsed.usage.context_tokens ?? 0;
+            }
+            if (parsed.model) result.model = parsed.model;
+            if (parsed.stop_reason) result.stopReason = parsed.stop_reason;
+            break;
+        }
+        case "tool_result_end": {
+            const msg = parsed.message;
+            if (msg) result.messages.push(msg);
+            break;
+        }
+        case "error": {
+            if (parsed.error?.message) result.errorMessage = parsed.error.message;
+            break;
+        }
+    }
 }
 
-/**
- * Pure reducer over parsed NDJSON events. Updates the accumulator in place of a
- * fresh copy — caller must use the returned state, not mutate the input.
- *
- *   message_end + assistant -> push msg, turn++, sum usage, capture model/stopReason/errorMessage
- *   message_end + other     -> push msg only
- *   tool_result_end         -> push msg only
- *   anything else           -> state unchanged (new object)
- */
-export function accumulateEvent(
-	state: RunnerAccumulatorState,
-	event: unknown,
-): RunnerAccumulatorState {
-	if (!event || typeof event !== "object") return { ...state };
-
-	const e = event as { type?: string; message?: Message };
-	const next: RunnerAccumulatorState = {
-		messages: [...state.messages],
-		usage: { ...state.usage },
-		model: state.model,
-		stopReason: state.stopReason,
-		errorMessage: state.errorMessage,
-	};
-
-	if (e.type === "message_end" && e.message) {
-		const msg = e.message;
-		next.messages.push(msg);
-		if (msg.role === "assistant") {
-			next.usage.turns += 1;
-			const usage = (msg as Message & { usage?: any }).usage;
-			if (usage) {
-				next.usage.input += usage.input || 0;
-				next.usage.output += usage.output || 0;
-				next.usage.cacheRead += usage.cacheRead || 0;
-				next.usage.cacheWrite += usage.cacheWrite || 0;
-				next.usage.cost += usage.cost?.total || 0;
-				if (usage.totalTokens) next.usage.contextTokens = usage.totalTokens;
-			}
-			const m = msg as Message & { model?: string; stopReason?: string; errorMessage?: string };
-			if (!next.model && m.model) next.model = m.model;
-			if (m.stopReason) next.stopReason = m.stopReason;
-			if (m.errorMessage) next.errorMessage = m.errorMessage;
-		}
-		return next;
-	}
-
-	if (e.type === "tool_result_end" && e.message) {
-		next.messages.push(e.message);
-		return next;
-	}
-
-	return next;
+export interface PiInvocationDeps {
+    execPath: string;
+    argv1: string;
+    existsSync: (p: string) => boolean;
 }
 
-// ---------------------------------------------------------------------------
-// Pure helper: write prompt to temp file (0600), cleaned in `finally` by caller.
-// ---------------------------------------------------------------------------
+export function getPiInvocation(args: string[], deps?: PiInvocationDeps): { command: string; args: string[] } {
+    const execPath = deps?.execPath ?? process.execPath;
+    const argv1 = deps?.argv1 ?? process.argv[1] ?? "";
+    const existsSync = deps?.existsSync ?? ((p: string) => {
+        try { return fs.existsSync(p); } catch { return false; }
+    });
 
-export async function writePromptToTempFile(
-	agentName: string,
-	prompt: string,
-): Promise<{ dir: string; filePath: string }> {
-	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
-	const safeName = agentName.replace(/[^\w.-]+/g, "_");
-	const filePath = path.join(tmpDir, `prompt-${safeName}.md`);
-	await withFileMutationQueue(filePath, async () => {
-		await fs.promises.writeFile(filePath, prompt, { encoding: "utf-8", mode: 0o600 });
-	});
-	return { dir: tmpDir, filePath };
+    // If argv1 is a real on-disk script (not bunfs), use it
+    if (argv1 && !argv1.includes("/$bunfs/") && existsSync(argv1)) {
+        return { command: execPath, args: [argv1, ...args] };
+    }
+
+    // If runtime is a generic node/bun, fall back to `pi` command
+    const basename = execPath.split("/").pop() ?? "";
+    if (basename === "node" || basename === "bun") {
+        return { command: "pi", args };
+    }
+
+    // Otherwise use execPath + argv1 as-is
+    return { command: execPath, args: [argv1, ...args] };
 }
 
-/** Resolve how to invoke pi (port from example): re-exec current script under same runtime, fallback `pi` command. */
-export function getPiInvocation(args: string[]): { command: string; args: string[] } {
-	const currentScript = process.argv[1];
-	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
-	if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
-		return { command: process.execPath, args: [currentScript, ...args] };
-	}
-
-	const execName = path.basename(process.execPath).toLowerCase();
-	const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
-	if (!isGenericRuntime) {
-		return { command: process.execPath, args };
-	}
-	return { command: "pi", args };
+export function capOutput(text: string, cap: number): string {
+    if (text.length <= cap) return text;
+    return text.slice(0, cap) + "…(truncated)";
 }
 
-// ---------------------------------------------------------------------------
-// Subprocess shell
-// ---------------------------------------------------------------------------
-
-export type SpawnFn = (
-	command: string,
-	args: string[],
-	opts: { cwd: string; stdio: ["ignore", "pipe", "pipe"]; shell: false },
-) => ChildProcess;
-
-const defaultSpawn: SpawnFn = (command, args, opts) =>
-	spawn(command, args, opts) as ChildProcess;
-
-export interface RunSingleAgentInput {
-	agents: AgentConfig[];
-	agentName: string;
-	task: string;
-	cwd: string | undefined;
-	defaultCwd: string;
-	step: number | undefined;
-	signal: AbortSignal | undefined;
-	onUpdate:
-		| ((partial: { content: { type: string; text: string }[]; details: SubagentDetails }) => void)
-		| undefined;
-	makeDetails: (results: SingleResult[]) => SubagentDetails;
-	/** Injectable spawn for hermetic tests. Defaults to child_process.spawn. */
-	spawn?: SpawnFn;
+export function substitutePrevious(task: string, previous: string): string {
+    return task.replace(/\{previous\}/g, previous);
 }
 
-export async function runSingleAgent(input: RunSingleAgentInput): Promise<SingleResult> {
-	const {
-		agents,
-		agentName,
-		task,
-		cwd,
-		defaultCwd,
-		step,
-		signal,
-		onUpdate,
-		makeDetails,
-		spawn: spawnFn = defaultSpawn,
-	} = input;
+export type RunModeType = "single" | "parallel" | "chain";
 
-	const agent = agents.find((a) => a.name === agentName);
-	if (!agent) {
-		const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
-		return {
-			agent: agentName,
-			agentSource: "unknown",
-			task,
-			exitCode: 1,
-			messages: [],
-			stderr: `Unknown agent: "${agentName}". Available agents: ${available}.`,
-			usage: emptyUsage(),
-			step,
-		};
-	}
-
-	const currentResult: SingleResult = {
-		agent: agentName,
-		agentSource: agent.source,
-		task,
-		exitCode: 0,
-		messages: [],
-		stderr: "",
-		usage: emptyUsage(),
-		model: agent.model,
-		step,
-	};
-
-	let tmpPromptDir: string | null = null;
-	let tmpPromptPath: string | null = null;
-
-	const emitUpdate = () => {
-		if (onUpdate) {
-			onUpdate({
-				content: [{ type: "text", text: getFinalOutputLocal(currentResult.messages) || "(running...)" }],
-				details: makeDetails([{ ...currentResult, messages: [...currentResult.messages], usage: { ...currentResult.usage } }]),
-			});
-		}
-	};
-
-	try {
-		const args = buildPiArgs({ task, model: agent.model, tools: agent.tools });
-		if (agent.systemPrompt.trim()) {
-			const tmp = await writePromptToTempFile(agent.name, agent.systemPrompt);
-			tmpPromptDir = tmp.dir;
-			tmpPromptPath = tmp.filePath;
-			args.splice(args.length - 1, 0, "--append-system-prompt", tmpPromptPath);
-		}
-
-		let wasAborted = false;
-		let accumulator: RunnerAccumulatorState = freshState();
-
-		const exitCode = await new Promise<number>((resolve) => {
-			const invocation = getPiInvocation(args);
-			const proc = spawnFn(invocation.command, invocation.args, {
-				cwd: cwd ?? defaultCwd,
-				stdio: ["ignore", "pipe", "pipe"],
-				shell: false,
-			});
-			let carry = "";
-
-			proc.stdout?.on("data", (data: Buffer) => {
-				const { events, carry: nextCarry } = parseNdjson(data.toString(), carry);
-				carry = nextCarry;
-				for (const event of events) {
-					accumulator = accumulateEvent(accumulator, event);
-				}
-				// Sync into currentResult
-				currentResult.messages = [...accumulator.messages];
-				currentResult.usage = { ...accumulator.usage };
-				if (accumulator.model) currentResult.model = accumulator.model;
-				if (accumulator.stopReason) currentResult.stopReason = accumulator.stopReason;
-				if (accumulator.errorMessage) currentResult.errorMessage = accumulator.errorMessage;
-				emitUpdate();
-			});
-
-			proc.stderr?.on("data", (data: Buffer) => {
-				currentResult.stderr += data.toString();
-			});
-
-			proc.on("close", (code) => {
-				if (carry.trim()) {
-					const { events } = parseNdjson(carry + "\n", "");
-					for (const event of events) {
-						accumulator = accumulateEvent(accumulator, event);
-					}
-					currentResult.messages = [...accumulator.messages];
-					currentResult.usage = { ...accumulator.usage };
-				}
-				resolve(code ?? 0);
-			});
-
-			proc.on("error", () => resolve(1));
-
-			if (signal) {
-				const killProc = () => {
-					wasAborted = true;
-					try {
-						proc.kill("SIGTERM");
-					} catch {
-						/* ignore */
-					}
-					setTimeout(() => {
-						if (!proc.killed) {
-							try {
-								proc.kill("SIGKILL");
-							} catch {
-								/* ignore */
-							}
-						}
-					}, 5000);
-				};
-				if (signal.aborted) killProc();
-				else signal.addEventListener("abort", killProc, { once: true });
-			}
-		});
-
-		currentResult.exitCode = exitCode;
-		if (wasAborted) throw new Error("Subagent was aborted");
-		return currentResult;
-	} finally {
-		if (tmpPromptPath) {
-			try {
-				fs.unlinkSync(tmpPromptPath);
-			} catch {
-				/* ignore */
-			}
-		}
-		if (tmpPromptDir) {
-			try {
-				fs.rmdirSync(tmpPromptDir);
-			} catch {
-				/* ignore */
-			}
-		}
-	}
+export interface SingleModeParams {
+    agent: string;
+    task: string;
+    cwd?: string;
 }
 
-// Local re-export to avoid circular import with render.ts.
-function getFinalOutputLocal(messages: Message[]): string {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const msg = messages[i];
-		if (msg.role === "assistant") {
-			for (const part of msg.content) {
-				if (part.type === "text") return part.text;
-			}
-		}
-	}
-	return "";
+export interface ParallelModeParams {
+    tasks: Array<{ agent: string; task: string; cwd?: string }>;
+}
+
+export interface ChainModeParams {
+    chain: Array<{ agent: string; task: string; cwd?: string }>;
+}
+
+export type ModeParams = SingleModeParams | ParallelModeParams | ChainModeParams;
+
+export interface ModeResult {
+    content: string;
+    details?: any;
+    isError?: boolean;
+}
+
+export interface RunSingleAgentDeps {
+    spawn?: typeof import("node:child_process").spawn;
+}
+
+export async function runMode(
+    mode: RunModeType,
+    agents: import("./agents.ts").AgentConfig[],
+    params: ModeParams,
+    defaultCwd: string,
+    signal: AbortSignal,
+    onUpdate: (update: any) => void,
+    runSingle: (defaultCwd: string, agents: import("./agents.ts").AgentConfig[], agentName: string, task: string, cwd: string | undefined, step: number | undefined, signal: AbortSignal, onUpdate: (result: SingleResult) => void) => Promise<SingleResult>,
+): Promise<ModeResult> {
+    switch (mode) {
+        case "single": {
+            const p = params as SingleModeParams;
+            const result = await runSingle(defaultCwd, agents, p.agent, p.task, p.cwd, undefined, signal, onUpdate);
+            const content = result.outputText || result.stderr || "";
+            return {
+                content,
+                details: result,
+                isError: result.exitCode !== 0,
+            };
+        }
+        case "parallel": {
+            const p = params as ParallelModeParams;
+            if (p.tasks.length > MAX_PARALLEL_TASKS) {
+                return {
+                    content: `Error: too many parallel tasks (${p.tasks.length}), max is ${MAX_PARALLEL_TASKS}`,
+                    isError: true,
+                };
+            }
+            const results = await mapWithConcurrencyLimit(p.tasks, MAX_CONCURRENCY, async (task, idx) => {
+                const r = await runSingle(defaultCwd, agents, task.agent, task.task, task.cwd, idx, signal, onUpdate);
+                return r;
+            });
+            // Cap model-visible output
+            const fullText = results.map((r, i) => `[${i}] ${r.agentName}: ${r.outputText}`).join("\n");
+            const content = capOutput(fullText, PER_TASK_OUTPUT_CAP);
+            return {
+                content,
+                details: results,
+                isError: results.some(r => r.exitCode !== 0),
+            };
+        }
+        case "chain": {
+            const p = params as ChainModeParams;
+            let previous = "";
+            for (let i = 0; i < p.chain.length; i++) {
+                const step = p.chain[i]!;
+                const task = substitutePrevious(step.task, previous);
+                const result = await runSingle(defaultCwd, agents, step.agent, task, step.cwd, i, signal, onUpdate);
+                if (result.exitCode !== 0) {
+                    return {
+                        content: `Chain failed at step ${i} (agent "${step.agent}"): ${result.stderr || result.outputText}`,
+                        details: { failedStep: i, failedAgent: step.agent, results: undefined },
+                        isError: true,
+                    };
+                }
+                previous = result.outputText || "";
+            }
+            return {
+                content: previous,
+                isError: false,
+            };
+        }
+    }
+}
+
+export async function runSingleAgent(
+    defaultCwd: string,
+    agents: import("./agents.ts").AgentConfig[],
+    agentName: string,
+    task: string,
+    cwd: string | undefined,
+    step: number | undefined,
+    signal: AbortSignal,
+    onUpdate: (result: SingleResult) => void,
+    deps: RunSingleAgentDeps = {},
+): Promise<SingleResult> {
+    // Look up agent
+    const config = agents.find(a => a.name === agentName);
+    if (!config) {
+        const names = agents.map(a => a.name).join(", ");
+        const result = makeEmptyResult(agentName, "unknown");
+        result.exitCode = 1;
+        result.stderr = `Unknown agent "${agentName}". Available: ${names}`;
+        return result;
+    }
+
+    const resolvedCwd = cwd ?? defaultCwd;
+    const result = makeEmptyResult(agentName, config.source);
+    let tempFiles: string[] = [];
+
+    // Check pre-aborted signal early
+    if (signal.aborted) {
+        throw new Error("aborted");
+    }
+
+    // Build args
+    const options: BuildArgsOptions = {};
+    if (config.model) options.model = config.model;
+    if (config.tools) options.tools = config.tools;
+
+    let promptFilePath: string | undefined;
+    if (config.systemPrompt) {
+        const tmpDir = fs.mkdtempSync("minion-prompt-");
+        const tmpFile = path.join(tmpDir, "prompt.md");
+        fs.writeFileSync(tmpFile, config.systemPrompt, "utf-8");
+        promptFilePath = tmpFile;
+        tempFiles.push(tmpDir);
+    }
+    if (promptFilePath) options.promptFilePath = promptFilePath;
+
+    const agentArgs = buildAgentArgs(agentName, task, options);
+    const invocation = getPiInvocation(agentArgs);
+
+    let proc: any;
+    let closeResolve: () => void = () => {};
+    try {
+        const spawn = deps.spawn ?? defaultSpawn;
+
+        proc = spawn(invocation.command, invocation.args, {
+            cwd: resolvedCwd,
+            shell: false,
+            stdio: ["ignore", "pipe", "pipe"],
+        });
+
+        // Stdout: line-buffered JSON events
+        let buffer = "";
+        proc.stdout.on("data", (chunk: Buffer) => {
+            buffer += chunk.toString();
+            const lines = buffer.split("\n");
+            buffer = lines.pop() ?? "";
+            for (const line of lines) {
+                reduceEvent(result, line);
+            }
+            // Get latest output text
+            const lastMsg = result.messages[result.messages.length - 1];
+            if (lastMsg?.content?.[0]?.text) {
+                result.outputText = lastMsg.content[0].text;
+            }
+            onUpdate(result);
+        });
+
+        // Stderr: collect
+        proc.stderr.on("data", (chunk: Buffer) => {
+            result.stderr += chunk.toString();
+        });
+
+        // Abort handling
+        const abortHandler = () => {
+            if (proc && !proc.killed) {
+                proc.kill("SIGTERM");
+                setTimeout(() => {
+                    if (proc && !proc.killed) proc.kill("SIGKILL");
+                }, 5000).unref();
+            }
+            closeResolve();
+        };
+        signal.addEventListener("abort", abortHandler, { once: true });
+
+        // Wait for close
+        await new Promise<void>((resolve) => {
+            closeResolve = resolve;
+            proc.on("close", (code: number) => {
+                result.exitCode = code ?? 1;
+                resolve();
+            });
+            proc.on("error", (err: Error) => {
+                result.exitCode = 1;
+                result.errorMessage = err.message;
+                resolve();
+            });
+        });
+
+        signal.removeEventListener("abort", abortHandler);
+
+        if (signal.aborted) {
+            throw new Error("aborted");
+        }
+    } finally {
+        // Cleanup temp files
+        for (const t of tempFiles) {
+            try {
+                fs.rmSync(t, { recursive: true, force: true });
+            } catch {
+                // non-fatal
+            }
+        }
+    }
+
+    return result;
+}
+
+export function buildAgentArgs(agent: string, task: string, options: BuildArgsOptions = {}): string[] {
+    const args: string[] = ["--mode", "json", "-p", "--no-session"];
+
+    if (options.model) {
+        args.push("--model", options.model);
+    }
+
+    if (options.tools && options.tools.length > 0) {
+        args.push("--tools", options.tools.join(","));
+    }
+
+    if (options.promptFilePath) {
+        args.push("--append-system-prompt", options.promptFilePath);
+    }
+
+    args.push(`Task: ${task}`);
+    return args;
 }

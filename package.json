@@ -1,40 +1,30 @@
 {
   "name": "@aprimediet/minion",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "type": "module",
-  "description": "Lean subagent delegation for the pi coding agent — single / parallel / chain modes with isolated subprocesses. v2.1 adds primary-agent (plan/build) persona switching for the main loop. v2.1.1 fixes model format persistence.",
+  "description": "Subagent delegation extension for the pi coding agent — discover, list, and delegate tasks to specialized sub-agents.",
   "keywords": ["pi-package"],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aprimediet/pi-minion.git"
+  },
+  "bugs": {
+    "url": "https://github.com/aprimediet/pi-minion/issues"
+  },
+  "homepage": "https://github.com/aprimediet/pi-minion#readme",
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/"
   },
   "scripts": {
     "test": "vitest run",
-    "test:watch": "vitest",
-    "prepublishOnly": "node -e \"const pkg=require('./package.json'); if(!pkg.files||pkg.files.length===0){console.error('files field empty — abort');process.exit(1)}; console.log('Publishing '+pkg.name+'@'+pkg.version+' with files:', pkg.files)\"",
-    "pack:dry": "npm pack --dry-run"
+    "test:watch": "vitest"
   },
   "pi": {
-    "extensions": ["./index.ts"],
-    "prompts": ["./prompts"]
+    "extensions": ["./index.ts"]
   },
-  "files": [
-    "index.ts",
-    "schema.ts",
-    "render.ts",
-    "agents.ts",
-    "config.ts",
-    "modes.ts",
-    "runner.ts",
-    "primaries.ts",
-    "agents/**",
-    "primaries/**",
-    "prompts/**",
-    "templates/**",
-    "README.md",
-    "LICENSE"
-  ],
+  "files": ["index.ts", "agents.ts", "runner.ts", "render.ts", "agents/**", "README.md"],
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-agent-core": "*",
@@ -44,6 +34,7 @@
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
+    "typescript": "^5.9.0",
     "vitest": "^1.6.0"
   },
   "engines": {
