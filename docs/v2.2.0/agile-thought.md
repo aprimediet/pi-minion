@@ -1,4 +1,4 @@
-# minion v2.2.0 — Phase 2: Agile Orchestration Engine (Thinking Doc)
+# minion v2.2.0 — Agile Orchestration Engine (Thinking Doc)
 
 > **Status:** Thinking / exploration — the **code-backed** alternative to
 > [`./thought.md`](./thought.md) (the zero-code SDD design). Builds on v2.0

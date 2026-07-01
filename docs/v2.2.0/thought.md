@@ -1,4 +1,4 @@
-# minion v2.2.0 — Phase 2: Spec-Driven Project Management (Thinking Doc)
+# minion v2.2.0 — Spec-Driven Project Management (Thinking Doc)
 
 > **Status:** Thinking / exploration. Builds on v2.0 (subagent delegation),
 > v2.1 (primary agents), and v2.2.0 Phase 1 (`/init` → `PRD.md` + `AGENTS.md`).
